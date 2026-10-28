@@ -1,4 +1,4 @@
-# YT2VM©: YouTube to VM
+# YT2VM©: YouTube to VM (vibecoded sorry its cuz of school slowing me down with updates)
 
 A lightweight Python project that connects YouTube-related workflows to a virtual machine setup. It is designed to help automate VM-based tasks, stream management, and control flows in a simple and open-source way.
 
@@ -36,8 +36,12 @@ Attention: `pywin32` works on Windows only and should be installed if you use th
 
 ## Do I have to credit you?
 
-No. It is free to use forever.
+Please do it, I spend alot of time on the prompts.
+
+## FILTERS!
+Welcome B64 filters, Still wip, Please make a Pull request if you have any fixes!
 
 ## Is this script malware?
 
 No. All source code is open to everyone, so you can inspect it yourself. There are no stealers or malicious components in this repository.
+
