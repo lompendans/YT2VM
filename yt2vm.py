@@ -26,6 +26,9 @@ import tkinter as tk
 from tkinter import scrolledtext, filedialog, messagebox, ttk
 import tkinter.font as tkfont
 import threading, time, sys, traceback, random, subprocess, os, re, json, platform, ctypes, collections, queue, shutil, gc
+import math
+import asyncio
+import hashlib
 import urllib.request, urllib.error, urllib.parse
 from ctypes import wintypes
 
@@ -650,6 +653,13 @@ plog("START", f"logs -> {_OUT_LOG} (everything printed), {SESSION_LOG}, {CRASH_L
 plog("START", f"verbose={_OUT_VERBOSE} (--debug for per-command/per-tick detail, --no-print to silence the console)")
 if "--quickedit" not in sys.argv:
     plog("START", f"console quick-edit mode: {_disable_quickedit()}")
+def _appdir():
+    try:
+        d = os.path.dirname(os.path.abspath(sys.argv[0]))
+        return d if d and os.path.isdir(d) else os.getcwd()
+    except Exception:
+        return os.getcwd()
+
 settings_file = f"settings{suffix}.json"
 stats_file = f"stats{suffix}.json"
 log_file = f"server_log{suffix}.txt"
@@ -1252,8 +1262,603 @@ mclick modhelp move music mute nuke pardon pausechat pausesong pin ping protect 
 remake2 replay restartnow restartvm resumesong revert revertnow roll run s say scene scroll send settle shout shutdown
 skip skipsong slowmode snapshotnow startvm stats stopsong strikes swichsnapshot switchsnapshot t testanticopyright
 timeout title trace type unban unlock unlockall unmute uptime vmstatus vmswitch volumedown volumeup votedrop voterandom
-votereplay voteshuffle votestop w wait warn whois lclick""".split())
+votereplay voteshuffle votestop w wait warn whois lclick tob64 eb64 unblock unb64""".split())
 
+
+_B64_ALPHA_RUN = re.compile(r"[A-Za-z0-9+/]{64,}={0,2}")
+_B64_PS_HOST = re.compile(r"\b(powershell|pwsh)(\.exe)?\b")
+_B64_PS_ENC = re.compile(r"(?:^|\s)[-/](?:e|ec|en|enc|enco|encod|encode|encoded|encodedc|encodedco|encodedcom|encodedcomm|"
+                         r"encodedcomma|encodedcomman|encodedcommand|encodedarguments|ea)\s+[a-z0-9+/]{8,}={0,2}")
+_B64_RULES = (
+    (re.compile(r"frombase64"), "FromBase64String decode"),
+    (re.compile(r"b64decode|a2b_base64|decodebytes|decodestring|standard_b64decode|urlsafe_b64decode"), "python base64 decode"),
+    (re.compile(r"import\W{0,4}base64|from\W{0,4}base64\W{0,4}import|__import__\W{0,4}base64"), "python base64 import"),
+    (re.compile(r"codecs\W{0,4}decode.{0,40}base64|['\"]base64['\"]\W{0,4}\)\W{0,4}decode"), "python codecs base64"),
+    (re.compile(r"certutil(?:\.exe)?\W{0,4}[-/](?:decode|decodehex|urlcache)"), "certutil -decode"),
+    (re.compile(r"\bbase64\s+(?:-d|--decode|-D|-di)\b"), "base64 --decode"),
+    (re.compile(r"openssl\s+(?:enc\s+)?(?:-a\s+)?(?:-d\s+)?base64|openssl\s+enc\s+-d\s+-base64"), "openssl base64"),
+    (re.compile(r"data:[a-z0-9.+-]+/[a-z0-9.+-]+;base64,"), "base64 data URI"),
+    (re.compile(r"\batob\s*\("), "javascript atob"),
+    (re.compile(r"convert\W{0,4}::\W{0,4}from"), "[Convert]:: decode"),
+)
+
+
+def _b64_scan(text):
+    raw = str(text or "")
+    if len(raw) < 8:
+        return None
+    norm = raw.replace("^", "").replace("`", "")
+    low = norm.lower()
+    squash = re.sub(r"[\s'\"+(),&{}\[\]$;]", "", low)
+    if _B64_PS_HOST.search(low) or _B64_PS_HOST.search(squash):
+        if _B64_PS_ENC.search(" " + re.sub(r"['\"]", "", low)):
+            return "PowerShell -EncodedCommand"
+    for rx, why in _B64_RULES:
+        if rx.search(low) or rx.search(squash):
+            return why
+    for m in _B64_ALPHA_RUN.finditer(norm):
+        run = m.group(0).rstrip("=")
+        kinds = sum(1 for test in (str.isupper, str.islower, str.isdigit) if any(test(c) for c in run))
+        uniq = len(set(run))
+        if len(run) >= 64 and kinds >= 2 and uniq >= 18:
+            return f"{len(run)}-character base64 blob"
+    return None
+
+
+def _token_file():
+    return os.path.splitext(settings_file)[0] + "_discord_token.json"
+
+
+def _dpapi(data, protect):
+    from ctypes import wintypes as _wt
+    class _BLOB(ctypes.Structure):
+        _fields_ = [("cbData", _wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    buf = ctypes.create_string_buffer(data, len(data))
+    blob_in = _BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    blob_out = _BLOB()
+    fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    if not fn(ctypes.byref(blob_in), None, None, None, None, 0x01, ctypes.byref(blob_out)):
+        raise OSError(f"DPAPI {'protect' if protect else 'unprotect'} failed ({ctypes.GetLastError()})")
+    try:
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        kernel32.LocalFree(ctypes.cast(blob_out.pbData, ctypes.c_void_p))
+
+
+def _clean_token(token):
+    t = str(token or "").strip().strip("\"'").strip()
+    if t.lower().startswith("bot "):
+        t = t[4:].strip()
+    return t
+
+
+def discord_token_save(token):
+    import base64 as _b
+    token = _clean_token(token)
+    doc = {"v": 1}
+    if token:
+        if platform.system() == "Windows":
+            try:
+                doc["dpapi"] = _b.b64encode(_dpapi(token.encode("utf-8"), True)).decode("ascii")
+            except Exception as e:
+                plog("DISCORD", f"DPAPI unavailable ({e}) - token stored without encryption")
+                doc["plain"] = token
+        else:
+            doc["plain"] = token
+    path = _token_file()
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(doc, f)
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+    return "dpapi" in doc
+
+
+def discord_token_load():
+    import base64 as _b
+    try:
+        with open(_token_file(), "r") as f:
+            doc = json.load(f)
+    except Exception:
+        return ""
+    if doc.get("dpapi"):
+        try:
+            return _dpapi(_b.b64decode(doc["dpapi"]), False).decode("utf-8")
+        except Exception as e:
+            plog("DISCORD", f"saved token could not be decrypted ({e}) - paste it again")
+            return ""
+    return str(doc.get("plain", ""))
+
+
+def _dc_name(user):
+    base = re.sub(r"[^a-z0-9_.]", "", str(getattr(user, "name", "") or "").lower())
+    return "dc_" + (base or str(getattr(user, "id", "user")))
+
+
+class DiscordBridge:
+
+    SETTLE = 0.9
+    MAX_BATCH_WAIT = 4.0
+    SHOT_GAP = 2.5
+    LOG_GAP = 2.0
+
+    def __init__(self, app):
+        self.app = app
+        self.thread = None
+        self.loop = None
+        self.client = None
+        self.state = "stopped"
+        self.detail = ""
+        self.mode = "crossplay"
+        self.user_tag = ""
+        self.guilds = []
+        self.inbox = queue.Queue(maxsize=2000)
+        self._pressed = collections.deque(maxlen=300)
+        self._announce = collections.deque(maxlen=60)
+        self._logq = collections.deque(maxlen=3000)
+        self._stop = threading.Event()
+        self._gen = 0
+        self._msgs = collections.OrderedDict()
+        self._first_press = 0.0
+        self._last_press = 0.0
+        self._last_shot = 0.0
+        self._last_log = 0.0
+        self._warned = {}
+        self._empty_seen = 0
+        self.stats = {"in": 0, "cmds": 0, "sent": 0, "shots": 0, "blocked": 0, "errors": 0}
+        self.events = collections.deque(maxlen=200)
+        self.dirty = True
+        self.guilds_dirty = True
+        self._ingest_thread = None
+
+    @property
+    def running(self):
+        return self.thread is not None and self.thread.is_alive()
+
+    @property
+    def online(self):
+        return self.running and self.state == "online"
+
+    def cfg(self, key, default=None):
+        return self.app.config.get(key, default)
+
+    def _id(self, key):
+        try:
+            return int(str(self.cfg(key, "") or "0").strip() or 0)
+        except Exception:
+            return 0
+
+    def event(self, text):
+        self.events.append((time.strftime("%H:%M:%S"), str(text)))
+        self.dirty = True
+
+    def _set_state(self, state, detail=""):
+        changed = (state, detail) != (self.state, self.detail)
+        self.state, self.detail = state, detail
+        self.dirty = True
+        if changed:
+            plog("DISCORD", f"{state}" + (f" - {detail}" if detail else ""))
+            self.event(f"{state}" + (f": {detail}" if detail else ""))
+
+    def _warn_once(self, key, text, every=60):
+        now = time.time()
+        if now - self._warned.get(key, 0) < every:
+            return
+        self._warned[key] = now
+        self.event(text)
+        plog("DISCORD", text)
+
+    def start(self, token, mode="crossplay"):
+        self.mode = mode if mode in ("crossplay", "discord") else "crossplay"
+        self.dirty = True
+        self._want = True
+        if self.running:
+            if self._stop.is_set():
+                old = self.thread
+                def _restart(old=old, token=token, mode=mode):
+                    try:
+                        old.join(timeout=20)
+                    except Exception:
+                        pass
+                    if getattr(self, "_want", False) and not self.running:
+                        self.start(token, mode)
+                threading.Thread(target=_restart, daemon=True, name="discord-restart").start()
+                self.event("restarting - waiting for the old connection to close")
+                return
+            self.event(f"mode set to {self.mode_label()}")
+            return
+        token = _clean_token(token)
+        if not token:
+            self._set_state("error", "paste the bot token first")
+            return
+        self._stop.clear()
+        self._gen += 1
+        gen = self._gen
+        self.thread = threading.Thread(target=self._thread_main, args=(token, gen), daemon=True, name="discord-bot")
+        self.thread.start()
+        if self._ingest_thread is None or not self._ingest_thread.is_alive():
+            self._ingest_thread = threading.Thread(target=self._ingest_loop, daemon=True, name="discord-ingest")
+            self._ingest_thread.start()
+
+    def stop(self):
+        self._want = False
+        self._stop.set()
+        self._gen += 1
+        loop, client = self.loop, self.client
+        if loop is not None and client is not None:
+            try:
+                asyncio.run_coroutine_threadsafe(client.close(), loop)
+            except Exception as _ex:
+                _trace(_ex_where(), _ex)
+        self.dirty = True
+
+    def mode_label(self):
+        return "Discord + YouTube crossplay" if self.mode == "crossplay" else "Discord only"
+
+    def _import(self):
+        try:
+            import discord
+            return discord
+        except Exception:
+            pass
+        self._set_state("installing", "installing discord.py (first time only) ...")
+        ok, err = _pip_install(["discord.py"])
+        try:
+            import importlib
+            importlib.invalidate_caches()
+            import discord
+            self.event("discord.py installed")
+            return discord
+        except Exception as e:
+            self._set_state("error", f"discord.py could not be installed: {(err or str(e))[:160]}")
+            return None
+
+    def _thread_main(self, token, gen):
+        discord = self._import()
+        if discord is None:
+            return
+        errs = getattr(discord, "errors", discord)
+        login_fail = getattr(errs, "LoginFailure", None) or getattr(discord, "LoginFailure", Exception)
+        intents_fail = getattr(errs, "PrivilegedIntentsRequired", None) or getattr(discord, "PrivilegedIntentsRequired", None)
+        delay = 5
+        while not self._stop.is_set() and gen == self._gen:
+            self._set_state("connecting", "logging in")
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            client = None
+            fatal = None
+            err = "connection closed"
+            try:
+                client = self._make_client(discord)
+                self.loop, self.client = loop, client
+                loop.run_until_complete(self._runner(client, token))
+            except login_fail:
+                fatal = "Discord rejected the token. Copy a fresh one from the Developer Portal (Bot > Reset Token)."
+            except Exception as e:
+                if intents_fail is not None and isinstance(e, intents_fail):
+                    fatal = "Turn on MESSAGE CONTENT INTENT in the Developer Portal (Bot > Privileged Gateway Intents), then press Enable again."
+                else:
+                    err = f"{type(e).__name__}: {str(e)[:140]}"
+                    self.stats["errors"] += 1
+            finally:
+                try:
+                    if client is not None and not client.is_closed():
+                        loop.run_until_complete(client.close())
+                except Exception:
+                    pass
+                try:
+                    pend = [t for t in asyncio.all_tasks(loop) if not t.done()]
+                    for t in pend:
+                        t.cancel()
+                    if pend:
+                        loop.run_until_complete(asyncio.gather(*pend, return_exceptions=True))
+                except Exception:
+                    pass
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+                self.loop, self.client = None, None
+            if fatal:
+                self._set_state("error", fatal)
+                return
+            if self._stop.is_set() or gen != self._gen:
+                break
+            self._set_state("error", f"disconnected ({err}) - retrying in {delay}s")
+            self._stop.wait(delay)
+            delay = min(delay * 2, 120)
+        if gen == self._gen or self._stop.is_set():
+            self._set_state("stopped", "")
+
+    async def _runner(self, client, token):
+        flusher = asyncio.ensure_future(self._flush_loop(client))
+        try:
+            await client.start(token)
+        finally:
+            flusher.cancel()
+
+    def _make_client(self, discord):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        client = discord.Client(intents=intents)
+        bridge = self
+
+        @client.event
+        async def on_ready():
+            bridge.user_tag = str(client.user)
+            bridge._scan(client)
+            bridge._set_state("online", f"logged in as {bridge.user_tag}")
+
+        @client.event
+        async def on_message(message):
+            try:
+                bridge._on_message(client, message)
+            except Exception as e:
+                bridge.stats["errors"] += 1
+                _trace(_ex_where(), e)
+
+        for name in ("on_guild_join", "on_guild_remove", "on_guild_channel_create",
+                     "on_guild_channel_delete", "on_guild_channel_update", "on_guild_update"):
+            async def _rescan(*a, **k):
+                bridge._scan(client)
+            _rescan.__name__ = name
+            client.event(_rescan)
+        return client
+
+    def _scan(self, client):
+        out = []
+        try:
+            for g in sorted(client.guilds, key=lambda x: str(x.name).lower()):
+                me = getattr(g, "me", None)
+                chans = []
+                for c in getattr(g, "text_channels", []):
+                    ok = True
+                    try:
+                        if me is not None:
+                            p = c.permissions_for(me)
+                            ok = bool(p.view_channel and p.send_messages)
+                    except Exception:
+                        ok = True
+                    chans.append((int(c.id), str(c.name), ok))
+                out.append((int(g.id), str(g.name), chans))
+        except Exception as e:
+            _trace(_ex_where(), e)
+        self.guilds = out
+        self.guilds_dirty = True
+        self.dirty = True
+
+    def channel_name(self, cid):
+        for gid, gname, chans in self.guilds:
+            for c, n, ok in chans:
+                if c == cid:
+                    return f"{gname} / #{n}"
+        return ""
+
+    def _on_message(self, client, message):
+        author = message.author
+        if getattr(author, "bot", False) or (client.user is not None and author.id == client.user.id):
+            return
+        play = self._id("discord_channel_id")
+        if not play or int(message.channel.id) != play:
+            return
+        content = str(message.content or "")
+        if not content.strip():
+            if not getattr(message, "attachments", None) and not getattr(message, "embeds", None):
+                self._empty_seen += 1
+                if self._empty_seen >= 3:
+                    self._warn_once("intent", "messages arrive empty - turn on MESSAGE CONTENT INTENT for the bot in the Developer Portal", 300)
+            return
+        self._empty_seen = 0
+        name = _dc_name(author)
+        display = str(getattr(author, "display_name", "") or getattr(author, "name", name))
+        guild = message.guild
+        owner_ids = set()
+        for tok in re.split(r"[\s,;]+", str(self.cfg("discord_owner_ids", "") or "")):
+            if tok.strip().isdigit():
+                owner_ids.add(int(tok.strip()))
+        is_owner = int(author.id) in owner_ids or (guild is not None and int(getattr(guild, "owner_id", 0) or 0) == int(author.id))
+        perms = getattr(author, "guild_permissions", None)
+        is_mod = bool(is_owner or (perms is not None and (perms.administrator or perms.manage_messages or perms.manage_guild)))
+        self.stats["in"] += 1
+        self._msgs[int(message.id)] = message
+        while len(self._msgs) > 300:
+            self._msgs.popitem(last=False)
+        shown = content
+        if self.cfg("b64_filter", True) and _b64_scan(content):
+            shown = f"[blocked by base64 filter - {len(content)} chars hidden]"
+        self.log_line(f"{display} ({name}){' [owner]' if is_owner else (' [mod]' if is_mod else '')}: {shown}")
+        try:
+            self.inbox.put_nowait((name, content, is_mod, is_owner, int(message.id), display))
+        except queue.Full:
+            self._warn_once("inbox", "too many Discord messages at once - some were dropped", 30)
+
+    def _ingest_loop(self):
+        while True:
+            try:
+                item = self.inbox.get(timeout=1.0)
+            except queue.Empty:
+                if self._stop.is_set() and not self.running:
+                    if self.inbox.empty():
+                        return
+                continue
+            name, content, is_mod, is_owner, mid, display = item
+            try:
+                res = self.app._ingest_chat(name, content, is_mod, is_owner, source="discord", ref=mid, display=display)
+                if res == "cmd":
+                    self.stats["cmds"] += 1
+            except Exception as e:
+                self.stats["errors"] += 1
+                log_crash("discord ingest", e)
+
+    def pressed(self, cmd, arg, user):
+        now = time.time()
+        if not self._pressed:
+            self._first_press = now
+        self._last_press = now
+        a = str(arg or "").replace("`", "'").replace("\n", " ")
+        if len(a) > 80:
+            a = a[:77] + "..."
+        who = str(user)[3:] if str(user).startswith("dc_") else str(user)
+        c = str(cmd)
+        if not c.startswith("!"):
+            c = "!" + c
+        self._pressed.append(f"`{c}{(' ' + a) if a else ''}` - {who}")
+        self.log_line(f"executed {c} {a} for {user}")
+
+    def announce(self, text):
+        self._announce.append(str(text))
+
+    def log_line(self, text):
+        if not self.cfg("discord_log_all", True) and not str(text).startswith("[!]"):
+            return
+        self._logq.append(f"[{time.strftime('%H:%M:%S')}] {text}")
+
+    def delete_message(self, mid):
+        msg = self._msgs.get(int(mid or 0))
+        loop = self.loop
+        if msg is None or loop is None:
+            return
+        async def _del():
+            try:
+                await msg.delete()
+                self.event(f"deleted the blocked message from {_dc_name(msg.author)}")
+            except Exception as e:
+                self._warn_once("delete", f"could not delete the blocked message ({type(e).__name__}) - give the bot Manage Messages", 120)
+        try:
+            asyncio.run_coroutine_threadsafe(_del(), loop)
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
+
+    def on_blocked(self, user, why, ref=None):
+        self.stats["blocked"] += 1
+        self.announce(f"Blocked {user}: base64 filter ({why}). That account can't send commands anymore.")
+        self.log_line(f"[!] base64 filter blocked {user}: {why}")
+        self.event(f"base64 filter blocked {user} ({why})")
+        if ref:
+            self.delete_message(ref)
+
+    async def _flush_loop(self, client):
+        try:
+            await client.wait_until_ready()
+        except Exception:
+            return
+        while not client.is_closed():
+            await asyncio.sleep(0.4)
+            try:
+                await self._flush_once(client)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.stats["errors"] += 1
+                self._warn_once("flush", f"send failed: {type(e).__name__}: {str(e)[:120]}", 30)
+
+    def _chan(self, client, key):
+        cid = self._id(key)
+        if not cid:
+            return None
+        ch = client.get_channel(cid)
+        if ch is None:
+            self._warn_once("chan" + key, f"channel {cid} not found - pick it again on the Discord page", 120)
+        return ch
+
+    async def _send(self, ch, content=None, path=None):
+        discord = sys.modules.get("discord")
+        kw = {}
+        try:
+            kw["allowed_mentions"] = discord.AllowedMentions.none()
+        except Exception:
+            pass
+        if path:
+            kw["file"] = discord.File(path, filename="vm.png")
+        try:
+            await ch.send(content=content, **kw)
+            self.stats["sent"] += 1
+            return True
+        except Exception as e:
+            nm = type(e).__name__
+            if nm == "Forbidden":
+                self._warn_once("forbid" + str(getattr(ch, "id", "")), f"no permission to post in #{getattr(ch, 'name', '?')} - give the bot Send Messages and Attach Files", 120)
+            else:
+                self._warn_once("send" + nm, f"send failed: {nm}: {str(e)[:120]}", 30)
+            self.stats["errors"] += 1
+            return False
+
+    @staticmethod
+    def _chunks(lines, limit=1900):
+        out, cur = [], ""
+        for ln in lines:
+            ln = ln if len(ln) <= limit else ln[:limit - 3] + "..."
+            if cur and len(cur) + 1 + len(ln) > limit:
+                out.append(cur)
+                cur = ln
+            else:
+                cur = (cur + "\n" + ln) if cur else ln
+        if cur:
+            out.append(cur)
+        return out
+
+    async def _flush_once(self, client):
+        now = time.time()
+        if self._announce:
+            ch = self._chan(client, "discord_channel_id")
+            lines = []
+            while self._announce:
+                lines.append(self._announce.popleft())
+            if ch is not None:
+                for part in self._chunks(lines):
+                    await self._send(ch, part)
+        if self._pressed and now - self._last_shot >= self.SHOT_GAP and (
+                now - self._last_press >= self.SETTLE or now - self._first_press >= self.MAX_BATCH_WAIT):
+            ch = self._chan(client, "discord_channel_id")
+            lines = []
+            while self._pressed:
+                lines.append(self._pressed.popleft())
+            self._last_shot = time.time()
+            if ch is not None:
+                shown = lines[-10:]
+                head = "**Pressed:**"
+                if len(lines) > len(shown):
+                    head += f" ({len(lines) - len(shown)} earlier not shown)"
+                text = head + "\n" + "\n".join(shown)
+                path, why = None, ""
+                if self.cfg("discord_screens", True):
+                    loop = asyncio.get_running_loop()
+                    try:
+                        path, why = await loop.run_in_executor(None, self.app._capture_vm_png)
+                    except Exception as e:
+                        path, why = None, f"{type(e).__name__}"
+                    if path:
+                        self.stats["shots"] += 1
+                    elif why:
+                        text += f"\n_(no screenshot: {why})_"
+                await self._send(ch, text[:1990], path)
+        if self._logq and now - self._last_log >= self.LOG_GAP:
+            self._last_log = now
+            ch = self._chan(client, "discord_log_channel_id")
+            if ch is None:
+                if not self._id("discord_log_channel_id"):
+                    self._logq.clear()
+                return
+            lines = []
+            while self._logq and len(lines) < 60:
+                lines.append(self._logq.popleft())
+            parts = self._chunks(lines)
+            for part in parts[:2]:
+                await self._send(ch, part)
+            for part in reversed(parts[2:]):
+                for ln in reversed(part.split("\n")):
+                    self._logq.appendleft(ln)
+
+
+
+async def _noop_rescan(bridge, client):
+    bridge._scan(client)
 
 def payload_is_dangerous(text):
     raw = str(text).lower()
@@ -2560,13 +3165,495 @@ _ng = [
     ("MAIN",    ["Dashboard", "VM Config", "Commands", "Settings"]),
     ("CONTROL", ["Keys", "Mouse", "Macros", "Quick Type", "Win Apps"]),
     ("MACHINE", ["VMS", "Snapshots", "OS Voting", "Real PC", "System"]),
-    ("STREAM",  ["OBS", "Overlays", "Media", "Music Queue", "Chat Tools", "Moderation"]),
+    ("STREAM",  ["OBS", "Discord", "Overlays", "Media", "Music Queue", "Chat Tools", "Moderation"]),
     ("TOOLS",   ["Automation", "Event Log", "Replay", "Backup", "Appearance", "Extra Things", "Help", "Diagnostics"]),
 ]
+
+_NG_ICON = {"MAIN": "main", "CONTROL": "control", "MACHINE": "machine", "STREAM": "stream", "TOOLS": "tools"}
+_NAV_ROW_ICONS = {"Discord": "bridge"}
+_LOGO_CACHE = {}
+
+
+def _user_logo(size):
+    size = int(size)
+    if size in _LOGO_CACHE:
+        return _LOGO_CACHE[size]
+    img = None
+    for path in (os.path.join(_appdir(), "discord_logo.png"), os.path.abspath("discord_logo.png")):
+        try:
+            if os.path.isfile(path):
+                raw = tk.PhotoImage(file=path)
+                f = max(1, int(round(max(raw.width(), raw.height()) / float(size))))
+                img = raw.subsample(f, f) if f > 1 else raw
+                break
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
+    _LOGO_CACHE[size] = img
+    return img
+
+_PAGE_BLURB = {
+    "Dashboard": "Live overview of chat, the machine and the stream.",
+    "VM Config": "Pick the backend, the target VM and the snapshot chat reverts to.",
+    "Commands": "Built-in chat commands and your own macros.",
+    "Settings": "Prefix, layout, timings and how much load chat is allowed to put on the VM.",
+    "Keys": "Send keys, text and combos straight into the VM.",
+    "Mouse": "Move, click and scroll inside the VM.",
+    "Macros": "One-click command sequences.",
+    "Quick Type": "Type whole blocks into the VM and keep reusable snippets.",
+    "Win Apps": "Launch Windows apps inside the VM through Win+R.",
+    "VMS": "Switch between VirtualBox and VMware and set up VNC input.",
+    "Snapshots": "Create, restore and delete snapshots for the active VM.",
+    "OS Voting": "Let chat vote on which OS runs next.",
+    "Real PC": "Route chat input to a physical machine through the Pico.",
+    "System": "Live internals and the recovery buttons.",
+    "OBS": "Scenes, media playback, the relay and overlay flashes.",
+    "Overlays": "Browser sources for OBS, served from this app.",
+    "Media": "Music queue controls and VM volume.",
+    "Music Queue": "What is playing and what is up next.",
+    "Chat Tools": "Announcements, flashes and test messages.",
+    "Moderation": "Blacklist viewers and manage votes.",
+    "Discord": "Run the same chat-plays commands from a Discord server, alongside or instead of YouTube.",
+    "Automation": "Commands that run on a timer.",
+    "Event Log": "Mod actions, votes, music and the raw chat log.",
+    "Replay": "Re-play recorded chat to the overlays with the original timing.",
+    "Backup": "Export logs and back up your configuration.",
+    "Appearance": "Theme, accent colour and text size.",
+    "Extra Things": "Run extra instances for multi-streaming.",
+    "Help": "Every chat command and who can use it.",
+    "Diagnostics": "Dependency, backend and recovery checks in one report.",
+}
+
+
+def _ease_out_cubic(p):
+    return 1.0 - (1.0 - p) ** 3
+
+
+def _ease_in_cubic(p):
+    return p * p * p
+
+
+def _ease_in_out(p):
+    return 4 * p * p * p if p < 0.5 else 1 - ((-2 * p + 2) ** 3) / 2
+
+
+def _ease_out_back(p):
+    c1 = 1.45
+    c3 = c1 + 1
+    return 1 + c3 * (p - 1) ** 3 + c1 * (p - 1) ** 2
+
+
+def _ease_linear(p):
+    return p
+
+
+class _Motion:
+
+    LEVELS = {"off": 0, "reduced": 1, "full": 2}
+
+    def __init__(self):
+        self.root = None
+        self.level = 2
+        self.tw = {}
+        self.loops = {}
+        self.val = {}
+        self.col = {}
+        self._after = None
+        self._last_loop = 0.0
+        self.frames = 0
+        self.worst_ms = 0.0
+        self._fps_n = 0
+        self._fps_t = time.perf_counter()
+        self.fps = 0.0
+        self._slow_logged = 0.0
+        self.errors = 0
+        self._in_frame = False
+        self.chains_blocked = 0
+
+    @property
+    def on(self):
+        return self.root is not None and self.level > 0
+
+    @property
+    def ambient(self):
+        return self.root is not None and self.level >= 2
+
+    def attach(self, root, level="full"):
+        self.root = root
+        self.set_level(level)
+
+    def set_level(self, level):
+        lv = self.LEVELS.get(str(level), 2) if not isinstance(level, int) else max(0, min(2, level))
+        self.level = lv
+        if lv == 0:
+            for key in list(self.tw):
+                self.finish(key)
+        if lv < 2:
+            for key, lp in list(self.loops.items()):
+                self._call(lp[0], 0.0)
+        self._kick()
+
+    def _call(self, fn, *a):
+        try:
+            fn(*a)
+            return True
+        except tk.TclError:
+            return False
+        except Exception as _ex:
+            self.errors += 1
+            _trace(_ex_where(), _ex)
+            return False
+
+    def tween(self, key, dur, fn, b=1.0, a=None, ease=_ease_out_cubic, done=None, delay=0, slow=False, scale=True):
+        if a is None:
+            a = self.val.get(key, 0.0 if b else 1.0)
+        old = self.tw.pop(key, None)
+        if not self.on or dur <= 0:
+            self.val[key] = b
+            ok = self._call(fn, b)
+            if done is not None and ok:
+                self._call(done)
+            return
+        if self.level == 1 and scale:
+            dur *= 0.55
+            delay *= 0.5
+        now = time.perf_counter()
+        self.tw[key] = [now + delay / 1000.0, dur / 1000.0, fn, float(a), float(b), ease, done, slow]
+        if delay <= 0:
+            self.val[key] = float(a)
+        self._kick()
+
+    def color(self, key, dur, setter, to, frm=None, ease=_ease_out_cubic, done=None, delay=0):
+        start = frm or self.col.get(key) or to
+        if _hx(start) == _hx(to) and key not in self.tw:
+            self.col[key] = to
+            self._call(setter, to)
+            if done is not None:
+                self._call(done)
+            return
+        def _step(p, s=start, t=to):
+            c = mix(s, t, max(0.0, min(1.0, p)))
+            self.col[key] = c
+            setter(c)
+        self.tween(key, dur, _step, 1.0, 0.0, ease, done, delay)
+
+    def busy(self, key):
+        return key in self.tw
+
+    def cancel(self, key):
+        self.tw.pop(key, None)
+
+    def finish(self, key):
+        tw = self.tw.pop(key, None)
+        if tw is None:
+            return
+        self.val[key] = tw[4]
+        if self._call(tw[2], tw[4]) and tw[6] is not None:
+            self._call(tw[6])
+
+    def loop(self, key, fn, period_ms, fps=30):
+        if key in self.loops:
+            self.loops[key][1] = period_ms / 1000.0
+            return
+        self.loops[key] = [fn, period_ms / 1000.0, time.perf_counter(), 1.0 / max(1, fps), 0.0]
+        if not self.ambient:
+            self._call(fn, 0.0)
+        self._kick()
+
+    def unloop(self, key, rest=True):
+        lp = self.loops.pop(key, None)
+        if lp is not None and rest:
+            self._call(lp[0], 0.0)
+
+    def looping(self, key):
+        return key in self.loops
+
+    def _kick(self):
+        if self._in_frame:
+            return
+        if self.root is None or self._after is not None:
+            return
+        if not self.tw and not (self.loops and self.ambient):
+            return
+        try:
+            self._after = self.root.after(16, self._frame)
+        except Exception:
+            self._after = None
+
+    def _frame(self):
+        self._after = None
+        if self.root is None:
+            return
+        self._in_frame = True
+        try:
+            self._frame_body()
+        finally:
+            self._in_frame = False
+
+    def _frame_body(self):
+        t0 = time.perf_counter()
+        try:
+            iconic = str(self.root.state()) == "iconic"
+        except Exception:
+            iconic = False
+        if iconic:
+            for key in list(self.tw):
+                self.finish(key)
+            if self._after is not None:
+                return
+            try:
+                self._after = self.root.after(400, self._frame) if (self.loops and self.ambient) else None
+            except Exception:
+                self._after = None
+            return
+        fast = False
+        for key, tw in list(self.tw.items()):
+            start, dur, fn, a, b, ease, done, slow = tw
+            if t0 < start:
+                fast = fast or not slow
+                continue
+            p = 1.0 if dur <= 0 else min(1.0, (t0 - start) / dur)
+            try:
+                e = ease(p)
+            except Exception:
+                e = p
+            v = a + (b - a) * e
+            self.val[key] = v
+            ok = self._call(fn, v)
+            if p >= 1.0 or not ok:
+                if self.tw.get(key) is tw:
+                    del self.tw[key]
+                if ok and done is not None:
+                    self._call(done)
+            elif not slow:
+                fast = True
+        if self.loops and self.ambient:
+            for key, lp in list(self.loops.items()):
+                fn, period, born, step, last = lp
+                if t0 - last < step:
+                    continue
+                lp[4] = t0
+                ph = ((t0 - born) / period) % 1.0 if period > 0 else 0.0
+                if not self._call(fn, ph):
+                    self.loops.pop(key, None)
+        el = (time.perf_counter() - t0) * 1000.0
+        self.frames += 1
+        self._fps_n += 1
+        if el > self.worst_ms:
+            self.worst_ms = el
+        if t0 - self._fps_t >= 1.0:
+            self.fps = self._fps_n / (t0 - self._fps_t)
+            self._fps_n = 0
+            self._fps_t = t0
+        if el > 30 and t0 - self._slow_logged > 10:
+            self._slow_logged = t0
+            plog("MOTION-SLOW", f"animation frame took {el:.0f}ms  tweens={len(self.tw)} loops={len(self.loops)} "
+                                f"[{', '.join(str(k)[:28] for k in list(self.tw)[:6])}]")
+        if self._after is not None:
+            self.chains_blocked += 1
+            return
+        if self.tw or (self.loops and self.ambient):
+            delay = 16 if fast else 33
+            delay = max(4, delay - int(el))
+            try:
+                self._after = self.root.after(delay, self._frame)
+            except Exception:
+                self._after = None
+
+    def stats(self):
+        names = {0: "off", 1: "reduced", 2: "full"}
+        return f"{names.get(self.level, '?')} tweens={len(self.tw)} loops={len(self.loops)} fps={self.fps:.0f} worst={self.worst_ms:.0f}ms"
+
+
+MOTION = _Motion()
+
+
+def _clip_poly(pts, x1, y1, x2, y2):
+    def clip(poly, inside, cross):
+        out = []
+        if not poly:
+            return out
+        prev = poly[-1]
+        for cur in poly:
+            if inside(cur):
+                if not inside(prev):
+                    out.append(cross(prev, cur))
+                out.append(cur)
+            elif inside(prev):
+                out.append(cross(prev, cur))
+            prev = cur
+        return out
+    def xcross(xv):
+        return lambda p, q: (xv, p[1] + (q[1] - p[1]) * (xv - p[0]) / ((q[0] - p[0]) or 1e-9))
+    def ycross(yv):
+        return lambda p, q: (p[0] + (q[0] - p[0]) * (yv - p[1]) / ((q[1] - p[1]) or 1e-9), yv)
+    poly = list(pts)
+    poly = clip(poly, lambda p: p[0] >= x1, xcross(x1))
+    poly = clip(poly, lambda p: p[0] <= x2, xcross(x2))
+    poly = clip(poly, lambda p: p[1] >= y1, ycross(y1))
+    poly = clip(poly, lambda p: p[1] <= y2, ycross(y2))
+    return poly
+
+
+def _breath(ph):
+    return (1.0 - math.cos(2 * math.pi * ph)) / 2.0
+
+
+def _mo_inside(w, e):
+    try:
+        x, y = e.x_root, e.y_root
+        wx, wy = w.winfo_rootx(), w.winfo_rooty()
+        return wx <= x < wx + w.winfo_width() and wy <= y < wy + w.winfo_height()
+    except Exception:
+        return False
+
+
+def _mo_border_glow(fr):
+    key = ("bglow", str(fr))
+    def paint(c):
+        fr.configure(highlightbackground=c, highlightcolor=c)
+    def enter(e=None):
+        t = _STUDIO["tok"]
+        try:
+            if not t or int(fr.cget("highlightthickness")) <= 0:
+                return
+        except Exception:
+            return
+        MOTION.color(key, 170, paint, mix(t["line"], t["accent"], 0.5), frm=None if MOTION.busy(key) else t["line"])
+    def leave(e=None):
+        t = _STUDIO["tok"]
+        if not t or (e is not None and _mo_inside(fr, e)):
+            return
+        try:
+            if int(fr.cget("highlightthickness")) <= 0:
+                return
+        except Exception:
+            return
+        MOTION.color(key, 280, paint, t["line"])
+    fr.bind("<Enter>", enter, add="+")
+    fr.bind("<Leave>", leave, add="+")
+
+
+def _mo_hover_glow(outer, key, rest_role="line"):
+    def paint(c):
+        outer.configure(bg=c)
+    def enter(e=None):
+        t = _STUDIO["tok"]
+        if not t or getattr(outer, "_mo_lock", False):
+            return
+        MOTION.color(key, 160, paint, mix(t[rest_role], t["accent"], 0.55), frm=t[rest_role] if not MOTION.busy(key) else None)
+    def leave(e=None):
+        t = _STUDIO["tok"]
+        if not t or getattr(outer, "_mo_lock", False):
+            return
+        if e is not None and _mo_inside(outer, e):
+            return
+        MOTION.color(key, 260, paint, t[rest_role])
+    outer.bind("<Enter>", enter, add="+")
+    outer.bind("<Leave>", leave, add="+")
+
+
+def _rrect(cv, x1, y1, x2, y2, r, **kw):
+    r = max(0, min(r, (x2 - x1) / 2.0, (y2 - y1) / 2.0))
+    pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+           x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+    return cv.create_polygon(pts, smooth=True, splinesteps=12, **kw)
+
+
+def _draw_icon(cv, name, cx, cy, s, col, bg, w=1.7, tag="icon"):
+    u = s / 20.0
+    x0, y0 = cx - s / 2.0, cy - s / 2.0
+    def P(x, y):
+        return x0 + x * u, y0 + y * u
+    def line(*pts, width=None):
+        flat = []
+        for i in range(0, len(pts), 2):
+            flat += list(P(pts[i], pts[i + 1]))
+        cv.create_line(*flat, fill=col, width=width or w, capstyle="round", joinstyle="round", tags=tag)
+    def dot(x, y, r):
+        a, b = P(x - r, y - r)
+        c, d = P(x + r, y + r)
+        cv.create_oval(a, b, c, d, fill=col, outline="", tags=tag)
+    def box(x1, y1, x2, y2, r=1.6, fill=""):
+        a, b = P(x1, y1)
+        c, d = P(x2, y2)
+        _rrect(cv, a, b, c, d, r * u, fill=fill, outline=col, width=w, tags=tag)
+    if name == "main":
+        box(2.5, 2.5, 9, 9); box(11, 2.5, 17.5, 9); box(2.5, 11, 9, 17.5); box(11, 11, 17.5, 17.5)
+    elif name == "control":
+        box(1.5, 4.5, 18.5, 15.5, 2.2)
+        for x in (5.5, 8.5, 11.5, 14.5):
+            dot(x, 8.4, 0.95)
+        line(6.5, 12, 13.5, 12)
+    elif name == "machine":
+        box(2, 3, 18, 13.5, 1.8)
+        line(10, 13.8, 10, 16.8)
+        line(6.5, 17, 13.5, 17)
+    elif name == "stream":
+        dot(10, 10, 1.9)
+        for (a, b, c, d) in ((5.4, 5.4, 14.6, 14.6), (1.8, 1.8, 18.2, 18.2)):
+            p1, p2 = P(a, b), P(c, d)
+            for start in (-42, 138):
+                cv.create_arc(p1[0], p1[1], p2[0], p2[1], start=start, extent=84, style="arc",
+                              outline=col, width=w, tags=tag)
+    elif name == "tools":
+        for y, kx in ((5, 13), (10, 6.5), (15, 11)):
+            line(2.5, y, 17.5, y)
+            a, b = P(kx - 2.2, y - 2.2)
+            c, d = P(kx + 2.2, y + 2.2)
+            cv.create_oval(a, b, c, d, fill=bg, outline=col, width=w, tags=tag)
+    elif name == "search":
+        a, b = P(2.5, 2.5)
+        c, d = P(13.5, 13.5)
+        cv.create_oval(a, b, c, d, outline=col, width=w, tags=tag)
+        line(12, 12, 17.5, 17.5)
+    elif name == "sun":
+        a, b = P(6.4, 6.4)
+        c, d = P(13.6, 13.6)
+        cv.create_oval(a, b, c, d, outline=col, width=w, tags=tag)
+        import math as _m
+        for k in range(8):
+            ang = k * _m.pi / 4
+            line(10 + 5.6 * _m.cos(ang), 10 + 5.6 * _m.sin(ang), 10 + 7.8 * _m.cos(ang), 10 + 7.8 * _m.sin(ang))
+    elif name == "moon":
+        a, b = P(3, 3)
+        c, d = P(17, 17)
+        cv.create_oval(a, b, c, d, fill=col, outline="", tags=tag)
+        a, b = P(7, 0.8)
+        c, d = P(20, 13.8)
+        cv.create_oval(a, b, c, d, fill=bg, outline="", tags=tag)
+    elif name == "guide":
+        a, b = P(2, 2)
+        c, d = P(18, 18)
+        cv.create_oval(a, b, c, d, outline=col, width=w, tags=tag)
+        line(7.4, 7.6, 8.2, 5.9, 10, 5.3, 11.9, 5.9, 12.6, 7.6, 11.6, 9.4, 10, 10.6, 10, 12)
+        dot(10, 14.6, 1.0)
+    elif name == "chat":
+        box(2, 3, 18, 13.8, 2.4)
+        line(6, 13.8, 4.8, 17.6, 10, 13.8)
+    elif name == "note":
+        line(8, 15, 8, 3.5, 16, 2, 16, 13.5)
+        line(8, 7, 16, 5.5)
+        a, b = P(3, 12.5)
+        c, d = P(8.6, 17.5)
+        cv.create_oval(a, b, c, d, fill=col, outline="", tags=tag)
+        a, b = P(11, 11)
+        c, d = P(16.6, 16)
+        cv.create_oval(a, b, c, d, fill=col, outline="", tags=tag)
+    elif name == "bolt":
+        line(11.5, 2, 5.5, 11, 10, 11, 8.5, 18, 14.5, 9, 10, 9, 11.5, 2)
+    elif name == "bridge":
+        box(2, 2.5, 18, 14, 3.0)
+        line(6.2, 14, 5.0, 17.6, 9.8, 14)
+        line(5.4, 8.3, 9.0, 8.3)
+        line(7.2, 6.5, 7.2, 10.1)
+        dot(12.6, 7.2, 1.05)
+        dot(14.6, 9.4, 1.05)
+
 
 class SidebarNav(tk.Frame):
 
     GROUP_TITLES = {"MAIN": "Main", "CONTROL": "Control", "MACHINE": "Machine", "STREAM": "Stream", "TOOLS": "Tools"}
+    NAME_COLORS_DARK = ("#7AA2F7", "#9ECE6A", "#E0AF68", "#BB9AF7", "#7DCFFF", "#F7768E", "#73DACA", "#FF9E64")
 
     def __init__(self, master, app, **kw):
         tok = _STUDIO["tok"] or _studio_resolve("original")
@@ -2576,95 +3663,162 @@ class SidebarNav(tk.Frame):
         self._buttons = {}
         self._items = {}
         self._current = None
+        self._group = None
+        self._last_in_group = {}
         self._toasts = []
         self._tally = {}
+        self._rail_btns = {}
+        self._rail_hover = None
+        self._pulse = False
+        self._chat_count = 0
+        self._chat_alive = False
+        self._chat_hidden = bool(app.config.get("ui_chat_hidden", False))
+        self._chat_auto = False
+        self._rail_act = {}
+        self._rail_hov = {}
+        self._ind_y = None
+        self._ind_h = None
+        self._ind_label = None
+        self._ind_group = None
+        self._fl_i = 0
         s = float(getattr(app, "_ui_scale", 1.0) or 1.0)
+        self._s = s
 
-        self.side = tk.Frame(self, width=int(220 * s))
+        self.rail = tk.Frame(self, width=int(64 * s))
+        self.rail._studio_skip_tree = True
+        self.rail.pack(side="left", fill="y")
+        self.rail.pack_propagate(False)
+        self.logo = tk.Canvas(self.rail, width=int(64 * s), height=int(64 * s), bd=0, highlightthickness=0)
+        self.logo.pack(side="top", pady=(int(12 * s), int(14 * s)))
+        self.logo.bind("<Enter>", lambda e: self.shine())
+        for gname, _members in _ng:
+            cv = tk.Canvas(self.rail, width=int(64 * s), height=int(44 * s), bd=0, highlightthickness=0, cursor="hand2")
+            cv.pack(side="top", pady=int(2 * s))
+            cv.bind("<Button-1>", lambda e, g=gname: self.show_group(g, jump=True))
+            cv.bind("<Enter>", lambda e, g=gname: self._rail_enter(g))
+            cv.bind("<Leave>", lambda e, g=gname: self._rail_leave(g))
+            self._rail_btns[gname] = cv
+        self.rail_foot = tk.Frame(self.rail)
+        self.rail_foot.pack(side="bottom", pady=(0, int(14 * s)))
+        self._rail_extra = {}
+        for key, tip, fn in (("theme", "Switch light / dark", lambda: getattr(app, "toggle_dark_light", lambda: None)()),
+                             ("guide", "User guide", lambda: getattr(app, "show_welcome_guide", lambda **k: None)(force=True))):
+            cv = tk.Canvas(self.rail_foot, width=int(64 * s), height=int(40 * s), bd=0, highlightthickness=0, cursor="hand2")
+            cv.pack(side="top", pady=int(2 * s))
+            cv.bind("<Button-1>", lambda e, f=fn: f())
+            cv.bind("<Enter>", lambda e, k=key, t=tip: self._rail_enter(k, t))
+            cv.bind("<Leave>", lambda e, k=key: self._rail_leave(k))
+            self._rail_extra[key] = cv
+        self.rail_rule = tk.Frame(self, width=1)
+        self.rail_rule._studio_skip_tree = True
+        self.rail_rule.pack(side="left", fill="y")
+        self.tip = tk.Label(self, text="", padx=9, pady=4)
+        self.tip._studio_skip_tree = True
+
+        self.side = tk.Frame(self, width=int(212 * s))
         self.side._studio_skip_tree = True
         self.side.pack(side="left", fill="y")
         self.side.pack_propagate(False)
         self.brand = tk.Frame(self.side)
-        self.brand.pack(fill="x", padx=18, pady=(18, 12))
+        self.brand.pack(fill="x", padx=20, pady=(int(20 * s), int(14 * s)))
         self.brand_name = tk.Label(self.brand, text=getattr(app, "app_name", "YT2VM"), anchor="w")
         self.brand_name.pack(anchor="w")
-        self.brand_sub = tk.Label(self.brand, text="Chat-plays control desk", anchor="w")
+        self.brand_sub = tk.Label(self.brand, text=f"Control desk  {version}", anchor="w")
         self.brand_sub.pack(anchor="w", pady=(1, 0))
 
-        self.search_wrap = tk.Frame(self.side)
-        self.search_wrap.pack(fill="x", padx=14, pady=(2, 8))
-        self.search_var = tk.StringVar()
-        self.search = tk.Entry(self.search_wrap, textvariable=self.search_var, bd=0, relief="flat")
-        self.search.pack(fill="x", ipady=6, padx=1, pady=1)
-        self._search_hint = "Find a page   Ctrl+K"
-        self._search_has_hint = False
-        self._show_search_hint()
-        self.search.bind("<FocusIn>", lambda e: self._hide_search_hint())
-        self.search.bind("<FocusOut>", lambda e: self._show_search_hint() if not self.search_var.get() else None)
-        self.search.bind("<Return>", self._search_enter)
-        self.search.bind("<Escape>", self._search_escape)
-        self.search.bind("<Down>", lambda e: self._search_enter(e))
-        self.search_var.trace_add("write", lambda *a: self._filter())
+        self.search_wrap = tk.Frame(self.side, cursor="hand2", highlightthickness=1, bd=0)
+        self.search_wrap.pack(fill="x", padx=14, pady=(0, int(18 * s)))
+        self.search_icon = tk.Canvas(self.search_wrap, width=int(18 * s), height=int(18 * s), bd=0, highlightthickness=0, cursor="hand2")
+        self.search_icon.pack(side="left", padx=(10, 6), pady=int(7 * s))
+        self.search_lbl = tk.Label(self.search_wrap, text="Search", anchor="w", cursor="hand2")
+        self.search_lbl.pack(side="left", fill="x", expand=True)
+        self.search_kbd = tk.Label(self.search_wrap, text="Ctrl K", padx=5, pady=0, cursor="hand2")
+        self.search_kbd.pack(side="right", padx=(4, 8))
+        for w in (self.search_wrap, self.search_icon, self.search_lbl, self.search_kbd):
+            w.bind("<Button-1>", lambda e: self.focus_search(e))
+            w.bind("<Enter>", lambda e: self._search_hover(True))
+            w.bind("<Leave>", lambda e: self._search_hover(False))
 
-        self.foot = tk.Frame(self.side)
-        self.foot.pack(side="bottom", fill="x", padx=12, pady=(6, 14))
-        self.theme_btn = tk.Label(self.foot, text="Light mode", anchor="w", padx=10, pady=6, cursor="hand2")
-        self.theme_btn.pack(fill="x")
-        self.theme_btn.bind("<Button-1>", lambda e: getattr(app, "toggle_dark_light", lambda: None)())
-        self.guide_btn = tk.Label(self.foot, text="User guide", anchor="w", padx=10, pady=6, cursor="hand2")
-        self.guide_btn.pack(fill="x", pady=(4, 0))
-        self.guide_btn.bind("<Button-1>", lambda e: getattr(app, "show_welcome_guide", lambda **k: None)(force=True))
-        for b in (self.theme_btn, self.guide_btn):
-            b.bind("<Enter>", lambda e, w=b: w.configure(bg=_studio_color("raised"), fg=_studio_color("hi")))
-            b.bind("<Leave>", lambda e, w=b: w.configure(bg=_studio_color("side"), fg=_studio_color("muted")))
+        self.group_head = tk.Frame(self.side)
+        self.group_head.pack(fill="x", padx=20, pady=(0, 6))
+        self.group_title = tk.Label(self.group_head, text="", anchor="w")
+        self.group_title.pack(side="left")
+        self.group_count = tk.Label(self.group_head, text="", anchor="e")
+        self.group_count.pack(side="right")
 
-        sc = tk.Canvas(self.side, bd=0, highlightthickness=0, yscrollincrement=20)
-        sc.pack(side="left", fill="both", expand=True)
-        self._navwrap = tk.Frame(sc)
-        sc.create_window((0, 0), window=self._navwrap, anchor="nw", tags="navwin")
-        def _navcfg(e=None):
-            try:
-                sc.configure(scrollregion=sc.bbox("all"))
-                sc.itemconfig("navwin", width=sc.winfo_width())
-            except Exception as _ex:
-                _trace(_ex_where(), _ex)
-        self._navwrap.bind("<Configure>", _navcfg)
-        sc.bind("<Configure>", _navcfg)
-        self._sc = sc
-        try: app._register_scroll(sc)
-        except Exception as _ex:
-            _trace(_ex_where(), _ex)
+        self.activity = tk.Frame(self.side, highlightthickness=1, bd=0)
+        self.activity.pack(side="bottom", fill="x", padx=14, pady=(8, 14))
+        self.act_head = tk.Frame(self.activity)
+        self.act_head.pack(fill="x", padx=12, pady=(10, 2))
+        self.act_dot = tk.Label(self.act_head, text="\u25cf", padx=0)
+        self.act_dot.pack(side="left")
+        self.act_title = tk.Label(self.act_head, text="Executor idle", anchor="w")
+        self.act_title.pack(side="left", padx=(6, 0))
+        self.act_cmd = tk.Label(self.activity, text="Nothing running", anchor="w", justify="left")
+        self.act_cmd.pack(fill="x", padx=12)
+        self.act_bar = tk.Canvas(self.activity, height=2, bd=0, highlightthickness=0)
+        self.act_bar.pack(fill="x", padx=12, pady=(6, 0))
+        self.act_sub = tk.Label(self.activity, text="Queue 0", anchor="w")
+        self.act_sub.pack(fill="x", padx=12, pady=(2, 10))
+
+        self._navwrap = tk.Frame(self.side)
+        self._navwrap.pack(fill="both", expand=True)
         self._group_frames = {}
         self._group_heads = {}
+        self._group_order = []
         for gname, _members in _ng:
             gf = tk.Frame(self._navwrap)
-            head = tk.Label(gf, text=self.GROUP_TITLES.get(gname, gname.title()), anchor="w")
-            head.pack(anchor="w", padx=20, pady=(0, 4))
             self._group_frames[gname] = gf
-            self._group_heads[gname] = head
-        self._group_order = [g for g, _ in _ng]
+            self._group_order.append(gname)
+        self._sc = self._navwrap
+        self._ind = tk.Frame(self._navwrap, width=3)
+        self._ind._studio_skip_tree = True
 
-        self.chatpane = tk.Frame(self, width=int(340 * s))
+        self.side_rule = tk.Frame(self, width=1)
+        self.side_rule._studio_skip_tree = True
+        self.side_rule.pack(side="left", fill="y")
+
+        self.chatpane = tk.Frame(self, width=int(318 * s))
         self.chatpane._studio_skip_tree = True
-        self.chatpane.pack(side="right", fill="y")
         self.chatpane.pack_propagate(False)
         self.chat_rule = tk.Frame(self.chatpane, width=1)
         self.chat_rule.pack(side="left", fill="y")
         self.chat_card = tk.Frame(self.chatpane)
-        self.chat_card.pack(side="left", fill="both", expand=True)
+        self.chat_card.place(relx=1.0, y=0, anchor="ne", width=int(318 * s) - 1, relheight=1.0)
         hdr = tk.Frame(self.chat_card)
-        hdr.pack(fill="x", padx=16, pady=(18, 10))
+        hdr.pack(fill="x", padx=18, pady=(int(20 * s), 2))
         self.chat_hdr = hdr
         self.chat_title = tk.Label(hdr, text="Live chat", anchor="w")
         self.chat_title.pack(side="left")
-        self.chat_dot = tk.Label(hdr, text="offline")
-        self.chat_dot.pack(side="right")
-        self.chatbox = scrolledtext.ScrolledText(self.chat_card, bd=0, highlightthickness=0, wrap="word",
-                                                 padx=14, pady=10, spacing1=2, spacing3=4, cursor="arrow")
-        self.chatbox.pack(fill="both", expand=True, padx=0, pady=0)
+        self.chat_state = tk.Frame(hdr, highlightthickness=1, bd=0)
+        self.chat_state.pack(side="right")
+        self.chat_state_dot = tk.Label(self.chat_state, text="\u25cf", padx=0)
+        self.chat_state_dot.pack(side="left", padx=(8, 0))
+        self.chat_dot = tk.Label(self.chat_state, text="offline")
+        self.chat_dot.pack(side="left", padx=(4, 9), pady=1)
+        self.chat_sub = tk.Label(self.chat_card, text="No messages yet", anchor="w")
+        self.chat_sub.pack(fill="x", padx=18, pady=(0, 10))
+        self.chat_sep = tk.Frame(self.chat_card, height=1)
+        self.chat_sep.pack(fill="x")
+        self.chat_body = tk.Frame(self.chat_card)
+        self.chat_body.pack(fill="both", expand=True)
+        self.chatbox = scrolledtext.ScrolledText(self.chat_body, bd=0, highlightthickness=0, wrap="word",
+                                                 padx=16, pady=12, spacing1=3, spacing3=6, cursor="arrow")
+        self.chatbox.pack(fill="both", expand=True)
         self.chatbox.configure(state="disabled")
+        self.chat_empty = tk.Frame(self.chat_body)
+        self.chat_empty_icon = tk.Canvas(self.chat_empty, width=int(40 * s), height=int(40 * s), bd=0, highlightthickness=0)
+        self.chat_empty_icon.pack(pady=(0, 10))
+        self.chat_empty_t = tk.Label(self.chat_empty, text="Waiting for chat")
+        self.chat_empty_t.pack()
+        self.chat_empty_s = tk.Label(self.chat_empty, text="Viewer messages show up here as\nsoon as the chat bot is connected.", justify="center")
+        self.chat_empty_s.pack(pady=(4, 0))
+        self.chat_empty.place(relx=0.5, rely=0.42, anchor="center")
+        MOTION.loop("chatempty", self._chat_empty_frame, 2600, fps=30)
+        self.chat_foot_sep = tk.Frame(self.chat_card, height=1)
+        self.chat_foot_sep.pack(fill="x")
         arow = tk.Frame(self.chat_card)
-        arow.pack(fill="x", padx=14, pady=(8, 12))
+        arow.pack(fill="x", padx=14, pady=(10, 12))
         self.chat_foot = arow
         self.autoscroll = tk.BooleanVar(value=True)
         self.autoscroll_cb = ttk.Checkbutton(arow, text="Follow new messages", variable=self.autoscroll,
@@ -2673,34 +3827,49 @@ class SidebarNav(tk.Frame):
         self.clear_btn = tk.Button(arow, text="Clear", bg="#27272A", fg="white", bd=0, cursor="hand2", command=self.clear_chat)
         self.clear_btn.pack(side="right")
 
-        self.status = tk.Frame(self, height=int(26 * s))
+        self.status = tk.Frame(self, height=int(28 * s))
         self.status._studio_skip_tree = True
-        self.status.pack(side="bottom", fill="x")
         self.status.pack_propagate(False)
+        self.status_rule = tk.Frame(self.status, height=1)
+        self.status_rule.pack(side="top", fill="x")
         self.status_left = tk.Label(self.status, text="Ready")
         self.status_left.pack(side="left", padx=16)
+        self.chat_toggle = tk.Label(self.status, text="Hide chat", cursor="hand2", padx=8)
+        self.chat_toggle.pack(side="right", padx=(0, 10))
+        self.chat_toggle.bind("<Button-1>", lambda e: self.toggle_chat_pane())
         self.status_right = tk.Label(self.status, text="")
-        self.status_right.pack(side="right", padx=16)
+        self.status_right.pack(side="right", padx=(16, 6))
+        self.status_hint = tk.Label(self.status, text="Ctrl K  palette     Ctrl Tab  next page     Ctrl L  console     Ctrl J  chat")
+        self.status_hint.pack(side="left", padx=16)
 
         self.main = tk.Frame(self)
         self.main._studio_skip = True
-        self.main.pack(side="left", fill="both", expand=True)
-        self.header = tk.Frame(self.main, height=int(66 * s))
+        self.header = tk.Frame(self.main, height=int((92 + 6 * max(0, int(_STUDIO.get("delta", 0)))) * s))
         self.header._studio_skip_tree = True
         self.header.pack(side="top", fill="x")
         self.header.pack_propagate(False)
-        self.page_title = tk.Label(self.header, text="", anchor="w")
-        self.page_title.pack(side="left", padx=(28, 10), pady=(14, 8))
-        self.tally_bar = tk.Frame(self.header)
-        self.tally_bar.pack(side="right", padx=(10, 22), pady=(16, 10))
-        for key, txt in (("chat", "Off air"), ("vm", "VM stopped"), ("obs", "OBS offline"), ("queue", "Queue 0"), ("viewers", "0 viewers")):
+        self.hdr_top = tk.Frame(self.header)
+        self.hdr_top.pack(side="top", fill="x", padx=(30, 24), pady=(int(14 * s), 0))
+        self.tally_bar = tk.Frame(self.hdr_top)
+        self.tally_bar.pack(side="right", anchor="s", pady=(0, 2))
+        self.hdr_left = tk.Frame(self.hdr_top)
+        self.hdr_left.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.crumb = tk.Label(self.hdr_left, text="", anchor="w")
+        self.crumb.pack(anchor="w")
+        self.page_title = tk.Label(self.hdr_left, text="", anchor="w")
+        self.page_title.pack(anchor="w")
+        self.page_desc = tk.Label(self.header, text="", anchor="w")
+        self.page_desc.pack(side="top", anchor="w", fill="x", padx=(31, 24), pady=(1, 0))
+        self._desc_full = ""
+        self.header.bind("<Configure>", lambda e: self._fit_desc())
+        for key, txt in (("chat", "OFF AIR"), ("vm", "VM stopped"), ("obs", "OBS offline"), ("queue", "Queue 0"), ("viewers", "0 viewers")):
             pill = tk.Frame(self.tally_bar, highlightthickness=1, bd=0)
-            pill.pack(side="left", padx=(6, 0))
+            pill.pack(side="left", padx=(8, 0))
             dot = tk.Label(pill, text="\u25cf", padx=0)
             if key in ("chat", "vm", "obs"):
-                dot.pack(side="left", padx=(9, 0), pady=3)
+                dot.pack(side="left", padx=(10, 0), pady=4)
             lbl = tk.Label(pill, text=txt)
-            lbl.pack(side="left", padx=(5 if key in ("chat", "vm", "obs") else 10, 10), pady=3)
+            lbl.pack(side="left", padx=(6 if key in ("chat", "vm", "obs") else 11, 11), pady=4)
             self._tally[key] = [pill, dot, lbl, "off"]
         self.header_rule = tk.Frame(self.main, height=1)
         self.header_rule._studio_skip_tree = True
@@ -2708,74 +3877,355 @@ class SidebarNav(tk.Frame):
         self.content = tk.Frame(self.main)
         self.content._studio_skip = True
         self.content.pack(side="top", fill="both", expand=True)
+
+        self._layout()
+        self.palette = CommandPalette(self, app)
+        self.bind("<Configure>", self._on_resize, add="+")
         self.apply_tokens()
 
-    def _show_search_hint(self):
-        if self.search_var.get():
+    def _layout(self, animate=False):
+        want = not self._chat_hidden and not self._chat_auto
+        full = int(318 * self._s)
+        try:
+            self.chat_toggle.configure(text="Hide chat" if want else "Show chat")
+        except Exception:
+            pass
+        shown = bool(self.chatpane.winfo_manager())
+        def setw(v):
+            self.chatpane.configure(width=max(1, int(full * max(0.0, min(1.0, v)))))
+        if animate and MOTION.on and want != shown:
+            if want:
+                self.chatpane.configure(width=1)
+                for w in (self.status, self.main):
+                    try: w.pack_forget()
+                    except Exception: pass
+                self.chatpane.pack(side="right", fill="y")
+                self.status.pack(side="bottom", fill="x")
+                self.main.pack(side="left", fill="both", expand=True)
+                self.status.lift()
+                MOTION.tween("chatpane", 300, setw, 1.0, a=MOTION.val.get("chatpane", 0.0) if MOTION.busy("chatpane") else 0.0)
+            else:
+                def _gone():
+                    if self._chat_hidden or self._chat_auto:
+                        self._layout(False)
+                MOTION.tween("chatpane", 230, setw, 0.0, a=MOTION.val.get("chatpane", 1.0) if MOTION.busy("chatpane") else 1.0,
+                             ease=_ease_in_cubic, done=_gone)
             return
-        self._search_has_hint = True
-        self.search.delete(0, "end")
-        self.search.insert(0, self._search_hint)
-        self.search.configure(fg=_studio_color("faint", "#666666"))
+        MOTION.cancel("chatpane")
+        MOTION.val["chatpane"] = 1.0 if want else 0.0
+        try: self.chatpane.configure(width=full)
+        except Exception: pass
+        for w in (self.chatpane, self.status, self.main):
+            try: w.pack_forget()
+            except Exception: pass
+        if want:
+            self.chatpane.pack(side="right", fill="y")
+        self.status.pack(side="bottom", fill="x")
+        self.main.pack(side="left", fill="both", expand=True)
+        try: self.status.lift()
+        except Exception: pass
 
-    def _hide_search_hint(self):
-        if self._search_has_hint:
-            self._search_has_hint = False
-            self.search.delete(0, "end")
-            self.search.configure(fg=_studio_color("hi", "#ffffff"))
+    def _on_resize(self, e=None):
+        try:
+            w = self.winfo_width()
+        except Exception:
+            return
+        narrow = w < int(1240 * self._s)
+        if narrow != self._chat_auto and not self._chat_hidden:
+            self._chat_auto = narrow
+            self._layout()
+            plog("UI", f"window {w}px wide - chat pane {'tucked away' if narrow else 'shown'}", verbose=True)
+        elif self._chat_hidden:
+            self._chat_auto = narrow
 
-    def _query(self):
-        if self._search_has_hint:
-            return ""
-        return self.search_var.get().strip().lower()
+    def toggle_chat_pane(self, _e=None):
+        if self._chat_auto and not self._chat_hidden:
+            self._chat_auto = False
+            self._chat_hidden = False
+        else:
+            self._chat_hidden = not self._chat_hidden
+        try:
+            self.app.config["ui_chat_hidden"] = self._chat_hidden
+            self.app.save_settings()
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
+        self._layout(animate=True)
+        return "break"
+
+    def _search_hover(self, on):
+        t = _STUDIO["tok"] or _studio_resolve("original")
+        def paint(c):
+            self.search_wrap.configure(highlightbackground=c, highlightcolor=c)
+        MOTION.color("search_hover", 120 if on else 240, paint, t["muted"] if on else t["line"])
 
     def focus_search(self, _e=None):
-        self.search.focus_set()
-        self._hide_search_hint()
-        self.search.select_range(0, "end")
+        try:
+            self.palette.open(from_click=_e is not None and str(getattr(_e, "type", "")) in ("ButtonPress", "4"))
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
         return "break"
 
-    def _search_enter(self, _e=None):
-        q = self._query()
-        for frame, label in self._pages:
-            row = self._items.get(label)
-            if row and (not q or q in label.lower()):
-                self.select(frame)
-                break
-        return "break"
+    def _rail_fade(self, key, to, dur):
+        def fn(v, k=key):
+            self._rail_hov[k] = max(0.0, min(1.0, v))
+            if k in self._rail_btns:
+                self._paint_rail_btn(k)
+            else:
+                self._paint_rail_extra(k)
+        MOTION.tween(("railh", key), dur, fn, to, a=self._rail_hov.get(key, 0.0))
 
-    def _search_escape(self, _e=None):
-        self.search_var.set("")
-        try: self.content.focus_set()
+    def _rail_enter(self, key, tip=None):
+        self._rail_hover = key
+        self._rail_fade(key, 1.0, 120)
+        cv = self._rail_btns.get(key) or self._rail_extra.get(key)
+        text = tip or self.GROUP_TITLES.get(key, key)
+        if cv is None:
+            return
+        try:
+            t = _STUDIO["tok"] or _studio_resolve("original")
+            self.tip.configure(text=text, bg=t["raised"], fg=t["hi"], font=_sf("ui", 9, "semi"))
+            y = cv.winfo_rooty() - self.winfo_rooty() + cv.winfo_height() // 2
+            x0 = self.rail.winfo_width()
+            self.tip.place(x=x0 + 2, y=y, anchor="w")
+            self.tip.lift()
+            def step(v, x0=x0):
+                tt = _STUDIO["tok"] or t
+                self.tip.place_configure(x=int(x0 + 2 + 7 * v))
+                self.tip.configure(fg=mix(tt["raised"], tt["hi"], max(0.0, min(1.0, v))))
+            MOTION.tween("railtip", 170, step, 1.0, a=0.0, ease=_ease_out_back)
+        except Exception:
+            pass
+
+    def _rail_leave(self, key):
+        if self._rail_hover == key:
+            self._rail_hover = None
+        MOTION.cancel("railtip")
+        try: self.tip.place_forget()
         except Exception: pass
-        self._show_search_hint()
-        return "break"
+        self._rail_fade(key, 0.0, 240)
+
+    def shine(self):
+        if MOTION.busy("logo_shine"):
+            return
+        MOTION.tween("logo_shine", 950, lambda v: self._paint_logo(v), 1.0, a=0.0, ease=_ease_in_out,
+                     done=lambda: self._paint_logo())
+
+    def _paint_logo(self, shine=None):
+        t = _STUDIO["tok"] or _studio_resolve("original")
+        rail = t.get("rail", t["side"])
+        s = self._s
+        cv = self.logo
+        cv.delete("all")
+        cv.configure(bg=rail)
+        sz = int(36 * s)
+        ox = (int(64 * s) - sz) / 2.0
+        oy = (int(64 * s) - sz) / 2.0
+        _rrect(cv, ox, oy, ox + sz, oy + sz, 9 * s, fill=t["accent"], outline="")
+        if shine is not None and 0.0 < shine < 1.0:
+            bw = 9 * s
+            x0 = ox - sz + shine * (2.4 * sz)
+            pts = [(x0, oy + sz + 4), (x0 + bw, oy + sz + 4), (x0 + bw + sz * 0.8, oy - 4), (x0 + sz * 0.8, oy - 4)]
+            poly = _clip_poly(pts, ox + 3 * s, oy + 3 * s, ox + sz - 3 * s, oy + sz - 3 * s)
+            if len(poly) >= 3:
+                cv.create_polygon(*[c for pt in poly for c in pt], fill=mix(t["accent"], "#FFFFFF", 0.42), outline="")
+        c = t["on_accent"]
+        cx = ox + sz / 2.0
+        cv.create_line(cx - 7 * s, oy + 10 * s, cx, oy + 18 * s, cx + 7 * s, oy + 10 * s,
+                       fill=c, width=2.6 * s, capstyle="round", joinstyle="round")
+        cv.create_line(cx, oy + 18 * s, cx, oy + 27 * s, fill=c, width=2.6 * s, capstyle="round")
+
+    def _paint_rail_btn(self, g):
+        cv = self._rail_btns.get(g)
+        if cv is None:
+            return
+        t = _STUDIO["tok"] or _studio_resolve("original")
+        rail = t.get("rail", t["side"])
+        s = self._s
+        W, H = int(64 * s), int(44 * s)
+        act = max(0.0, min(1.0, self._rail_act.get(g, 0.0)))
+        over = self._rail_act.get(g, 0.0)
+        hov = max(0.0, min(1.0, self._rail_hov.get(g, 0.0)))
+        cv.delete("all")
+        cv.configure(bg=rail)
+        bg = mix(mix(rail, t["raised"], hov), t["accent_tint"], act)
+        if act > 0.01 or hov > 0.01:
+            grow = 1.0 + 0.10 * max(0.0, over - 1.0) * 6
+            ins = 12 * s / grow
+            _rrect(cv, ins, 3 * s, W - ins, H - 3 * s, 10 * s, fill=bg, outline="")
+        if act > 0.01:
+            bh = (H - 24 * s) * max(0.0, over)
+            cy = H / 2.0
+            cv.create_rectangle(0, cy - bh / 2.0, 3 * s, cy + bh / 2.0, fill=t["accent"], outline="")
+        col = mix(mix(t["muted"], t["hi"], hov), t["accent_text"], act)
+        _draw_icon(cv, _NG_ICON.get(g, "main"), W / 2.0, H / 2.0, 19 * s, col, bg if (act > 0.01 or hov > 0.01) else rail, w=1.6 * s)
+
+    def _paint_rail_extra(self, k):
+        cv = self._rail_extra.get(k)
+        if cv is None:
+            return
+        t = _STUDIO["tok"] or _studio_resolve("original")
+        rail = t.get("rail", t["side"])
+        s = self._s
+        W, H = int(64 * s), int(40 * s)
+        hov = max(0.0, min(1.0, self._rail_hov.get(k, 0.0)))
+        cv.delete("all")
+        cv.configure(bg=rail)
+        ibg = rail
+        if hov > 0.01:
+            ibg = mix(rail, t["raised"], hov)
+            _rrect(cv, 14 * s, 2 * s, W - 14 * s, H - 2 * s, 9 * s, fill=ibg, outline="")
+        icon = "guide" if k == "guide" else ("sun" if t["dark"] else "moon")
+        _draw_icon(cv, icon, W / 2.0, H / 2.0, 17 * s, mix(t["faint"], t["hi"], hov), ibg, w=1.5 * s)
+
+    def _paint_rail(self):
+        try:
+            if not MOTION.busy("logo_shine"):
+                self._paint_logo()
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
+        for g in self._rail_btns:
+            try: self._paint_rail_btn(g)
+            except Exception as _ex:
+                _trace(_ex_where(), _ex)
+        for k in self._rail_extra:
+            try: self._paint_rail_extra(k)
+            except Exception as _ex:
+                _trace(_ex_where(), _ex)
+
+    def show_group(self, group, jump=False):
+        if group not in self._group_frames:
+            return
+        if group != self._group:
+            first = self._group is None
+            for g, gf in self._group_frames.items():
+                if g != group:
+                    gf.pack_forget()
+            self._group_frames[group].pack(fill="x")
+            self._group = group
+            try:
+                self.group_title.configure(text=self.GROUP_TITLES.get(group, group.title()))
+            except Exception:
+                pass
+            for g in self._rail_btns:
+                target = 1.0 if g == group else 0.0
+                cur = self._rail_act.get(g, 0.0)
+                if abs(cur - target) < 0.001:
+                    continue
+                def fn(v, gg=g):
+                    self._rail_act[gg] = v
+                    self._paint_rail_btn(gg)
+                MOTION.tween(("raila", g), 340 if target else 220, fn, target, a=cur,
+                             ease=_ease_out_back if target else _ease_out_cubic)
+            if not first and MOTION.on:
+                self._cascade(group)
+        try:
+            n = sum(1 for it in self._items.values() if it[3] == group)
+            self.group_count.configure(text=f"{n} page{'s' if n != 1 else ''}")
+        except Exception:
+            pass
+        if jump:
+            target = self._last_in_group.get(group)
+            if target is None:
+                for f, l in self._pages:
+                    it = self._items.get(l)
+                    if it and it[3] == group:
+                        target = f
+                        break
+            if target is not None and target is not self._current:
+                self.select(target)
+
+    def _cascade(self, group):
+        t = _STUDIO["tok"] or _studio_resolve("original")
+        gf = self._group_frames.get(group)
+        if gf is None:
+            return
+        def ttl(v):
+            tt = _STUDIO["tok"] or t
+            vv = max(0.0, min(1.0, v))
+            self.group_title.configure(fg=mix(tt["side"], tt["hi"], vv))
+            self.group_count.configure(fg=mix(tt["side"], tt["faint"], vv))
+            self.group_title.pack_configure(padx=(int(10 * (1 - vv)), 0))
+        MOTION.tween("navgroup", 260, ttl, 1.0, a=0.0)
+        for i, row in enumerate(gf.pack_slaves()):
+            lab = getattr(row, "_nav_label", None)
+            it = self._items.get(lab)
+            if it is None:
+                continue
+            row._mo_cascade = True
+            try:
+                row.pack_configure(padx=(30, 12))
+                it[2].configure(fg=t["side"])
+            except Exception:
+                pass
+            def step(v, row=row, lbl=it[2], lab=lab):
+                tt = _STUDIO["tok"] or t
+                fg = self._item_target(lab)[1]
+                row.pack_configure(padx=(int(round(10 + 20 * (1 - v))), 12))
+                lbl.configure(fg=mix(tt["side"], fg, max(0.0, min(1.0, v))))
+            def done(row=row, lab=lab):
+                row._mo_cascade = False
+                try: row.pack_configure(padx=(10, 12))
+                except Exception: pass
+                self._paint_item(lab, instant=True)
+            MOTION.tween(("casc", lab), 340, step, 1.0, a=0.0, delay=i * 34, done=done)
+
+    def _move_indicator(self, animate=True):
+        t = _STUDIO["tok"] or _studio_resolve("original")
+        lab = self.label_of(self._current) if self._current is not None else ""
+        it = self._items.get(lab)
+        try:
+            self._ind.configure(bg=t["accent"])
+        except Exception:
+            pass
+        if not it or it[3] != self._group:
+            try: self._ind.place_forget()
+            except Exception: pass
+            self._ind_label = None
+            return
+        row = it[0]
+        try:
+            self._navwrap.update_idletasks()
+            y = row.winfo_y() + row.master.winfo_y() + 8
+            h = max(6, row.winfo_height() - 16)
+        except Exception:
+            return
+        x = 10
+        same = (self._ind_label is not None and self._ind_group == self._group and self._ind_y is not None)
+        if self._ind_label == lab and same and not MOTION.busy("navind"):
+            self._ind.place(x=x, y=y, width=3, height=h)
+            self._ind_y, self._ind_h = y, h
+            return
+        prev_y = self._ind_y if self._ind_y is not None else y
+        self._ind_label, self._ind_group = lab, self._group
+        if not animate or not MOTION.on:
+            MOTION.cancel("navind")
+            self._ind.place(x=x, y=y, width=3, height=h)
+            self._ind_y, self._ind_h = y, h
+            return
+        if same:
+            y0 = prev_y
+            dist = abs(y - y0)
+            def step(v, y0=y0, y1=y, h=h, dist=dist):
+                vv = max(0.0, min(1.0, v))
+                cy = y0 + (y1 - y0) * v
+                hh = h + dist * 0.45 * math.sin(math.pi * vv)
+                self._ind_y = cy
+                self._ind.place(x=x, y=int(cy - (hh - h) / 2.0), width=3, height=max(2, int(hh)))
+            MOTION.tween("navind", 320, step, 1.0, a=0.0, ease=_ease_in_out)
+        else:
+            self._ind.place_forget()
+            def step(v, y1=y, h=h):
+                hh = max(1.0, h * max(0.0, v))
+                self._ind_y = y1
+                self._ind.place(x=x, y=int(y1 + (h - hh) / 2.0), width=3, height=int(hh))
+            MOTION.tween("navind", 380, step, 1.0, a=0.0, ease=_ease_out_back, delay=140)
+        self._ind_y, self._ind_h = y, h
+
+    def _query(self):
+        return ""
 
     def _filter(self):
-        q = self._query()
-        for g in self._group_order:
-            gf = self._group_frames[g]
-            gf.pack_forget()
-        shown_groups = set()
-        for frame, label in self._pages:
-            row = self._items.get(label)
-            if row is None:
-                continue
-            row[0].pack_forget()
-        for g in self._group_order:
-            any_shown = False
-            for frame, label in self._pages:
-                row = self._items.get(label)
-                if row is None or row[3] != g:
-                    continue
-                if not q or q in label.lower() or q in self.GROUP_TITLES.get(g, g).lower():
-                    row[0].pack(fill="x", padx=(10, 12))
-                    any_shown = True
-            if any_shown:
-                self._group_frames[g].pack(fill="x", pady=(10, 2))
-                shown_groups.add(g)
-        try: self._sc.yview_moveto(0)
-        except Exception: pass
+        return None
 
     def add(self, frame, text="", **kw):
         label = (text or "").strip()
@@ -2789,66 +4239,133 @@ class SidebarNav(tk.Frame):
             gf = tk.Frame(self._navwrap)
             self._group_frames[group] = gf
             self._group_order.append(group)
-        if not gf.winfo_manager():
-            self._filter_pack_group(group)
         row = tk.Frame(gf, cursor="hand2")
+        row._nav_label = label
         bar = tk.Frame(row, width=3)
-        bar.pack(side="left", fill="y", pady=3)
-        lbl = tk.Label(row, text=label, anchor="w", padx=12, pady=6, cursor="hand2")
+        bar.pack(side="left", fill="y", pady=7)
+        row._icon = None
+        if label in _NAV_ROW_ICONS:
+            isz = int(18 * self._s)
+            ic = tk.Canvas(row, width=isz, height=isz, bd=0, highlightthickness=0, cursor="hand2")
+            ic.pack(side="left", padx=(9, 0))
+            ic._glyph = _NAV_ROW_ICONS[label]
+            row._icon = ic
+            ic.bind("<Button-1>", lambda e, f=frame: self.select(f))
+            ic.bind("<Enter>", lambda e, l=label: self._hover(l, True))
+            ic.bind("<Leave>", lambda e, l=label: self._hover(l, False))
+        lbl = tk.Label(row, text=label, anchor="w", padx=(7 if label in _NAV_ROW_ICONS else 11), pady=7, cursor="hand2")
         lbl.pack(side="left", fill="x", expand=True)
-        row.pack(fill="x", padx=(10, 12))
-        for w in (row, lbl, bar):
+        badge = tk.Label(row, text="", padx=6, cursor="hand2")
+        members = next((m for g, m in _ng if g == group), [])
+        rank = members.index(label) if label in members else 999
+        row._nav_rank = rank
+        before = None
+        for other in gf.pack_slaves():
+            if getattr(other, "_nav_rank", 999) > rank:
+                before = other
+                break
+        if before is not None:
+            row.pack(fill="x", padx=(10, 12), pady=1, before=before)
+        else:
+            row.pack(fill="x", padx=(10, 12), pady=1)
+        for w in (row, lbl, bar, badge):
             w.bind("<Button-1>", lambda e, f=frame: self.select(f))
             w.bind("<Enter>", lambda e, l=label: self._hover(l, True))
             w.bind("<Leave>", lambda e, l=label: self._hover(l, False))
-        self._items[label] = [row, bar, lbl, group, frame]
+        self._items[label] = [row, bar, lbl, group, frame, badge, None, None]
         self._buttons[label] = (lbl, frame)
         self._paint_item(label)
         if self._current is None:
             self.select(frame)
         return frame
 
-    def _filter_pack_group(self, group):
-        order = self._group_order
-        before = None
-        for g in order[order.index(group) + 1:]:
-            if self._group_frames[g].winfo_manager():
-                before = self._group_frames[g]
-                break
-        if before is not None:
-            self._group_frames[group].pack(fill="x", pady=(10, 2), before=before)
-        else:
-            self._group_frames[group].pack(fill="x", pady=(10, 2))
+    def set_badge(self, label, text):
+        it = self._items.get(label)
+        if not it:
+            return
+        badge = it[5]
+        try:
+            if str(badge.cget("text")) == str(text or ""):
+                return
+            badge.configure(text=text or "")
+            if text:
+                badge.pack(side="right", padx=(0, 8))
+            else:
+                badge.pack_forget()
+            self._paint_item(label, instant=True)
+            if text and MOTION.on:
+                t = _STUDIO["tok"] or _studio_resolve("original")
+                def paint(c, b=badge):
+                    b.configure(bg=c)
+                rest = mix(it[6] or t["side"], t["hi"], 0.08)
+                MOTION.color(("badge", label), 900, paint, rest, frm=t["accent"])
+                MOTION.color(("badgefg", label), 900, lambda c, b=badge: b.configure(fg=c), t["text"], frm=t["on_accent"])
+        except Exception:
+            pass
 
     def _hover(self, label, on):
-        it = self._items.get(label)
-        if not it:
-            return
-        self._paint_item(label, hover=on)
+        if self._items.get(label):
+            self._paint_item(label, hover=on)
 
-    def _paint_item(self, label, hover=False):
+    def _item_target(self, label, hover=None):
+        it = self._items.get(label)
+        t = _STUDIO["tok"] or _studio_resolve("original")
+        if hover is None:
+            hover = getattr(it[0], "_mo_hover", False) if it else False
+        active = bool(it) and it[4] is self._current
+        side = t["side"]
+        if active:
+            return mix(side, t["accent"], 0.12), t["hi"], _sf("ui", 10, "semi"), True
+        if hover:
+            return mix(side, t["hi"], 0.05), t["hi"], _sf("ui", 10), False
+        return side, t["muted"], _sf("ui", 10), False
+
+    def _paint_item(self, label, hover=None, instant=False):
         it = self._items.get(label)
         if not it:
             return
-        row, bar, lbl = it[0], it[1], it[2]
-        active = it[4] is self._current
-        side = _studio_color("side", "#0D1013")
-        if active:
-            bg = mix(side, _STUDIO["tok"]["accent"], 0.13) if _STUDIO["tok"] else side
-            fg = _studio_color("hi")
-            barc = _STUDIO["tok"]["accent"] if _STUDIO["tok"] else "#F2A53A"
-            font = _sf("ui", 10, "semi")
-        else:
-            bg = mix(side, _studio_color("hi", "#ffffff"), 0.05) if hover else side
-            fg = _studio_color("hi") if hover else _studio_color("muted")
-            barc = bg
-            font = _sf("ui", 10)
+        row, bar, lbl, badge = it[0], it[1], it[2], it[5]
+        if hover is not None:
+            row._mo_hover = bool(hover)
+        bg, fg, font, active = self._item_target(label)
         try:
-            row.configure(bg=bg)
-            bar.configure(bg=barc)
-            lbl.configure(bg=bg, fg=fg, font=font)
+            lbl.configure(font=font)
         except Exception as _ex:
             _trace(_ex_where(), _ex)
+        def apply(bgc, fgc):
+            tt = _STUDIO["tok"] or _studio_resolve("original")
+            row.configure(bg=bgc)
+            bar.configure(bg=bgc)
+            lbl.configure(bg=bgc)
+            ic = getattr(row, "_icon", None)
+            if ic is not None:
+                ic.configure(bg=bgc)
+                ic.delete("all")
+                isz = int(ic.cget("width"))
+                img = _user_logo(isz)
+                if img is not None:
+                    ic.create_image(isz / 2.0, isz / 2.0, image=img)
+                else:
+                    _draw_icon(ic, ic._glyph, isz / 2.0, isz / 2.0, isz * 0.9, fgc, bgc, w=1.4 * self._s)
+            if not getattr(row, "_mo_cascade", False):
+                lbl.configure(fg=fgc)
+            if not MOTION.busy(("badge", label)):
+                badge.configure(bg=mix(bgc, tt["hi"], 0.08), fg=tt["text"], font=_sf("ui", 8, "semi"))
+            it[6], it[7] = bgc, fgc
+        if instant or not MOTION.on or it[6] is None:
+            MOTION.cancel(("navi", label))
+            try: apply(bg, fg)
+            except Exception as _ex:
+                _trace(_ex_where(), _ex)
+            return
+        b0, f0 = it[6], it[7]
+        if _hx(b0) == _hx(bg) and _hx(f0) == _hx(fg) and not MOTION.busy(("navi", label)):
+            return
+        dur = 90 if (hover and not active) else (230 if active else 200)
+        def step(p, b0=b0, f0=f0, b1=bg, f1=fg):
+            pp = max(0.0, min(1.0, p))
+            apply(mix(b0, b1, pp), mix(f0, f1, pp))
+        MOTION.tween(("navi", label), dur, step, 1.0, a=0.0)
 
     def tabs(self):
         return [str(f) for f, _ in self._pages]
@@ -2869,6 +4386,10 @@ class SidebarNav(tk.Frame):
                 return l
         return ""
 
+    def group_of(self, label):
+        it = self._items.get(label)
+        return it[3] if it else "TOOLS"
+
     def select(self, tab=None):
         if tab is None:
             return str(self._current) if self._current is not None else ""
@@ -2879,29 +4400,81 @@ class SidebarNav(tk.Frame):
                 target = f; break
         if target is None: return ""
         prev = self._current
+        animate = MOTION.on and prev is not None and prev is not target
         if prev is not None and prev is not target:
-            try: prev.pack_forget()
+            try:
+                prev.place_forget()
+                prev.pack_forget()
             except Exception as _ex:
                 _trace(_ex_where(), _ex)
         try:
-            target.pack(in_=self.content, fill="both", expand=True)
+            if prev is not target or not target.winfo_manager():
+                target.place(in_=self.content, x=0, y=(22 if animate else 0), relwidth=1.0, relheight=1.0)
+            self.status.lift()
         except Exception as e:
             try: console_log("ERROR", f"could not show tab: {e}")
             except Exception as _ex:
                 _trace(_ex_where(), _ex)
         self._current = target
+        name = self.label_of(target)
+        group = self.group_of(name)
+        self._last_in_group[group] = target
+        self.show_group(group)
         for lbl in list(self._items):
             self._paint_item(lbl)
-        name = self.label_of(target)
-        try: self.page_title.configure(text=name)
+        try:
+            self.page_title.configure(text=name)
+            self.crumb.configure(text=self.GROUP_TITLES.get(group, group.title()))
+            self._desc_full = getattr(self.app, "_page_desc", {}).get(name) or _PAGE_BLURB.get(name, "")
+            self._fit_desc()
         except Exception as _ex:
             _trace(_ex_where(), _ex)
+        if animate:
+            self._page_anim(target)
+        else:
+            MOTION.cancel("page")
+        try: self.after_idle(self._move_indicator)
+        except Exception: pass
         if prev is not target:
             plog("NAV", f"page -> {name}", verbose=True)
             try: self.app._on_page_shown(target)
             except Exception as _ex:
                 _trace(_ex_where(), _ex)
         return str(target)
+
+    def _page_anim(self, target):
+        def step(v, f=target):
+            t = _STUDIO["tok"] or _studio_resolve("original")
+            vv = max(0.0, min(1.0, v))
+            f.place_configure(y=int(round(22 * (1.0 - v))))
+            bg = t["bg"]
+            self.page_title.configure(fg=mix(bg, t["hi"], vv))
+            self.page_title.pack_configure(padx=(int(round(14 * (1.0 - vv))), 0))
+            self.crumb.configure(fg=mix(bg, t["accent_text"], vv))
+            self.page_desc.configure(fg=mix(bg, t["muted"], min(1.0, vv * 1.15)))
+        MOTION.tween("page", 360, step, 1.0, a=0.0, ease=_ease_out_cubic)
+
+    def _fit_desc(self):
+        try:
+            full = self._desc_full or ""
+            avail = self.header.winfo_width() - 60
+            if avail < 40:
+                self.page_desc.configure(text=full)
+                return
+            f = tkfont.Font(root=self, font=self.page_desc.cget("font"))
+            if f.measure(full) <= avail:
+                self.page_desc.configure(text=full)
+                return
+            lo, hi = 0, len(full)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if f.measure(full[:mid].rstrip() + "...") <= avail:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            self.page_desc.configure(text=full[:lo].rstrip() + "...")
+        except Exception:
+            pass
 
     def step(self, delta):
         if not self._pages:
@@ -2911,44 +4484,68 @@ class SidebarNav(tk.Frame):
 
     def apply_tokens(self):
         t = _STUDIO["tok"] or _studio_resolve("original")
-        side, panel = t["side"], t["panel"]
+        side, panel, rail = t["side"], t["panel"], t.get("rail", t["side"])
         try:
             self.configure(bg=t["bg"])
-            for w in (self.side, self.brand, self.foot, self._sc, self._navwrap, self.search_wrap):
+            self.rail.configure(bg=rail)
+            self.rail_foot.configure(bg=rail)
+            self.rail_rule.configure(bg=t["line"])
+            self.side_rule.configure(bg=t["line"])
+            for w in (self.side, self.brand, self._navwrap, self.group_head):
                 w.configure(bg=side)
-            self.search_wrap.configure(bg=t["line"])
-            self.search.configure(bg=t["input"], fg=t["faint"] if self._search_has_hint else t["hi"],
-                                  insertbackground=t["hi"], font=_sf("ui", 10), selectbackground=t["sel"],
-                                  selectforeground=t["hi"], highlightthickness=0)
-            self.brand_name.configure(bg=side, fg=t["hi"], font=_sf("display", 16))
-            self.brand_sub.configure(bg=side, fg=t["muted"], font=_sf("ui", 9))
+            self.brand_name.configure(bg=side, fg=t["hi"], font=_sf("display", 17))
+            self.brand_sub.configure(bg=side, fg=t["faint"], font=_sf("ui", 8))
+            sbg = t["input"]
+            self.search_wrap.configure(bg=sbg, highlightbackground=t["line"], highlightcolor=t["line"])
+            self.search_icon.configure(bg=sbg)
+            self.search_icon.delete("all")
+            _draw_icon(self.search_icon, "search", int(9 * self._s), int(9 * self._s), 14 * self._s, t["faint"], sbg, w=1.4 * self._s)
+            self.search_lbl.configure(bg=sbg, fg=t["faint"], font=_sf("ui", 9))
+            self.search_kbd.configure(bg=t["raised"], fg=t["muted"], font=_sf("mono", 8))
+            self.group_title.configure(bg=side, fg=t["hi"], font=_sf("display", 12))
+            self.group_count.configure(bg=side, fg=t["faint"], font=_sf("ui", 8))
             for g, gf in self._group_frames.items():
                 gf.configure(bg=side)
-            for g, h in self._group_heads.items():
-                h.configure(bg=side, fg=t["faint"], font=_sf("ui", 9, "semi"))
-            self.theme_btn.configure(bg=side, fg=t["muted"], font=_sf("ui", 9),
-                                     text=("Light mode" if t["dark"] else "Dark mode"))
-            self.guide_btn.configure(bg=side, fg=t["muted"], font=_sf("ui", 9))
-            for w in (self.chatpane, self.chat_card, self.chat_hdr, self.chat_foot):
+            self.activity.configure(bg=t["card"], highlightbackground=t["line"], highlightcolor=t["line"])
+            self.act_head.configure(bg=t["card"])
+            self.act_title.configure(bg=t["card"], fg=t["muted"], font=_sf("ui", 8, "semi"))
+            self.act_dot.configure(bg=t["card"], font=_sf("ui", 7))
+            self.act_cmd.configure(bg=t["card"], fg=t["hi"], font=_sf("mono", 9), wraplength=int(170 * self._s))
+            self.act_sub.configure(bg=t["card"], fg=t["faint"], font=_sf("ui", 8))
+            self._paint_activity()
+            for w in (self.chatpane, self.chat_card, self.chat_hdr, self.chat_foot, self.chat_body, self.chat_empty):
                 w.configure(bg=panel)
-            self.chat_rule.configure(bg=t["line"])
-            self.chat_title.configure(bg=panel, fg=t["hi"], font=_sf("display", 13))
-            self.chat_dot.configure(bg=panel, font=_sf("ui", 9))
+            for w in (self.chat_rule, self.chat_sep, self.chat_foot_sep):
+                w.configure(bg=t["line"])
+            self.chat_title.configure(bg=panel, fg=t["hi"], font=_sf("display", 14))
+            self.chat_sub.configure(bg=panel, fg=t["faint"], font=_sf("ui", 9))
+            self.chat_empty_icon.configure(bg=panel)
+            self.chat_empty_icon.delete("all")
+            _draw_icon(self.chat_empty_icon, "chat", int(20 * self._s), int(20 * self._s), 30 * self._s, t["faint"], panel, w=1.6 * self._s)
+            self.chat_empty_t.configure(bg=panel, fg=t["text"], font=_sf("ui", 10, "semi"))
+            self.chat_empty_s.configure(bg=panel, fg=t["faint"], font=_sf("ui", 9))
+            self._paint_chat_state()
             self.chatbox.frame.configure(bg=panel)
-            self.chatbox.configure(bg=panel, fg=t["text"], font=_sf("ui", 9), selectbackground=t["sel"],
+            self.chatbox.configure(bg=panel, fg=t["text"], font=_sf("ui", 10), selectbackground=t["sel"],
                                    selectforeground=t["hi"], insertbackground=t["hi"], inactiveselectbackground=t["sel"])
             self.chatbox.tag_config("ts", foreground=t["faint"], font=_sf("mono", 8))
-            self.chatbox.tag_config("n_usr", foreground=t["hi"], font=_sf("ui", 9, "semi"))
-            self.chatbox.tag_config("n_cmd", foreground=t["accent_text"], font=_sf("ui", 9, "semi"))
-            self.chatbox.tag_config("n_sys", foreground=t["ok"], font=_sf("ui", 9, "semi"))
-            self.chatbox.tag_config("n_err", foreground=t["bad"], font=_sf("ui", 9, "semi"))
-            self.chatbox.tag_config("n_mod", foreground=t["violet"], font=_sf("ui", 9, "semi"))
+            self.chatbox.tag_config("n_usr", foreground=t["hi"], font=_sf("ui", 10, "semi"))
+            self.chatbox.tag_config("n_cmd", foreground=t["accent_text"], font=_sf("ui", 10, "semi"))
+            self.chatbox.tag_config("n_sys", foreground=t["ok"], font=_sf("ui", 10, "semi"))
+            self.chatbox.tag_config("n_err", foreground=t["bad"], font=_sf("ui", 10, "semi"))
+            self.chatbox.tag_config("n_mod", foreground=t["violet"], font=_sf("ui", 10, "semi"))
+            for i, c in enumerate(self.NAME_COLORS_DARK):
+                col = c if t["dark"] else mix(c, "#000000", 0.42)
+                self.chatbox.tag_config(f"nc{i}", foreground=col, font=_sf("ui", 10, "semi"))
             self.chatbox.tag_config("m_usr", foreground=t["text"])
-            self.chatbox.tag_config("m_cmd", foreground=mix(t["accent_text"], t["text"], 0.35))
+            self.chatbox.tag_config("m_cmd", foreground=mix(t["accent_text"], t["text"], 0.35), font=_sf("mono", 9))
             self.chatbox.tag_config("m_sys", foreground=t["muted"])
             self.chatbox.tag_config("m_err", foreground=t["bad_soft"])
             self.chatbox.tag_config("m_mod", foreground=t["text"])
-            self.chatbox.tag_config("line", lmargin1=0, lmargin2=14)
+            self.chatbox.tag_config("b_mod", foreground=t["violet"], background=t["violet_tint"], font=_sf("ui", 7, "semi"))
+            self.chatbox.tag_config("b_own", foreground=t["on_accent"], background=t["accent"], font=_sf("ui", 7, "semi"))
+            self.chatbox.tag_config("b_sys", foreground=t["muted"], background=t["raised"], font=_sf("ui", 7, "semi"))
+            self.chatbox.tag_config("line", lmargin1=0, lmargin2=int(12 * self._s))
             for tg in ("usr", "cmd", "sys", "err", "mod"):
                 self.chatbox.tag_config(tg, foreground={"usr": t["text"], "cmd": t["accent_text"], "sys": t["ok"],
                                                           "err": t["bad"], "mod": t["violet"]}[tg])
@@ -2960,50 +4557,220 @@ class SidebarNav(tk.Frame):
             try: self.clear_btn.studio_style(panel, _sf("ui", 9, "semi"))
             except Exception as _ex:
                 _trace(_ex_where(), _ex)
-            self.status.configure(bg=side)
-            self.status_left.configure(bg=side, fg=t["faint"], font=_sf("ui", 9))
-            self.status_right.configure(bg=side, fg=t["faint"], font=_sf("ui", 9))
+            self.status.configure(bg=rail)
+            self.status_rule.configure(bg=t["line"])
+            self.status_left.configure(bg=rail, fg=t["muted"], font=_sf("ui", 8))
+            self.status_right.configure(bg=rail, fg=t["muted"], font=_sf("ui", 8))
+            self.status_hint.configure(bg=rail, fg=t["faint"], font=_sf("ui", 8))
+            self.chat_toggle.configure(bg=rail, fg=t["accent_text"], font=_sf("ui", 8, "semi"))
             self.main.configure(bg=t["bg"])
-            self.header.configure(bg=t["bg"])
+            self.header.configure(bg=t["bg"], height=int((92 + 6 * max(0, int(_STUDIO.get("delta", 0)))) * self._s))
+            self.hdr_left.configure(bg=t["bg"])
+            self.hdr_top.configure(bg=t["bg"])
             self.header_rule.configure(bg=t["line"])
             self.content.configure(bg=t["bg"])
-            self.page_title.configure(bg=t["bg"], fg=t["hi"], font=_sf("display", 19))
+            self.crumb.configure(bg=t["bg"], fg=t["accent_text"], font=_sf("ui", 8, "semi"))
+            self.page_title.configure(bg=t["bg"], fg=t["hi"], font=_sf("display", 21))
+            self.page_desc.configure(bg=t["bg"], fg=t["muted"], font=_sf("ui", 9))
             self.tally_bar.configure(bg=t["bg"])
             for key in self._tally:
                 self._paint_tally(key)
             for lbl in list(self._items):
-                self._paint_item(lbl)
+                self._paint_item(lbl, instant=True)
             for tw in list(self._toasts):
                 self._paint_toast(tw)
+            self._paint_rail()
+            self.act_bar.configure(bg=t["card"])
+            self._ind.configure(bg=t["accent"])
+            self.after_idle(lambda: self._move_indicator(False))
+            self.palette.apply_tokens()
+            self._fit_desc()
         except Exception as _ex:
             _trace(_ex_where(), _ex)
+
+    def set_activity(self, current, queued, waiting=0):
+        cur = (current or "").strip()
+        key = (cur, queued, waiting)
+        if getattr(self, "_act_key", None) == key:
+            return
+        self._act_key = key
+        try:
+            old_cmd = str(self.act_cmd.cget("text"))
+            if cur:
+                self.act_title.configure(text="Executing")
+                show = cur if len(cur) <= 60 else cur[:57] + "..."
+                self.act_cmd.configure(text=show)
+            else:
+                self.act_title.configure(text="Executor idle")
+                self.act_cmd.configure(text="Nothing running")
+            self.act_sub.configure(text=f"Queue {queued}" + (f"  /  {waiting} viewer{'s' if waiting != 1 else ''} waiting" if waiting else ""))
+            self._paint_activity()
+            t = _STUDIO["tok"] or _studio_resolve("original")
+            if str(self.act_cmd.cget("text")) != old_cmd:
+                MOTION.color("actcmd", 260, lambda c: self.act_cmd.configure(fg=c), t["hi"] if cur else t["faint"], frm=t["card"])
+            if cur and not MOTION.looping("exec"):
+                MOTION.loop("exec", self._exec_frame, 1400, fps=40)
+            elif not cur and MOTION.looping("exec"):
+                MOTION.unloop("exec")
+        except Exception:
+            pass
+
+    def _exec_frame(self, ph):
+        t = _STUDIO["tok"] or _studio_resolve("original")
+        cv = self.act_bar
+        cv.delete("all")
+        busy = bool(getattr(self, "_act_key", ("",))[0])
+        w = cv.winfo_width()
+        if not busy or w < 10:
+            self.act_dot.configure(fg=t["ok"] if busy else t["faint"])
+            return
+        cv.create_rectangle(0, 0, w, 2, fill=t["raised"], outline="")
+        seg = w * 0.38
+        x = -seg + _ease_in_out(ph) * (w + seg)
+        for i in range(6):
+            a = x + seg * i / 6.0
+            b = x + seg * (i + 1) / 6.0
+            k = 1.0 - abs(i - 2.5) / 3.0
+            cv.create_rectangle(max(0, a), 0, min(w, b), 2, fill=mix(t["raised"], t["ok"], max(0.0, k)), outline="")
+        self.act_dot.configure(fg=mix(t["ok"], t["card"], 0.55 * _breath(ph)))
+
+    def _paint_activity(self):
+        t = _STUDIO["tok"] or _studio_resolve("original")
+        busy = bool(getattr(self, "_act_key", ("",))[0])
+        try:
+            self.act_dot.configure(fg=(t["ok"] if busy else t["faint"]))
+            self.act_cmd.configure(fg=(t["hi"] if busy else t["faint"]))
+        except Exception:
+            pass
+
+    def set_chat_state(self, alive):
+        alive = bool(alive)
+        if alive == self._chat_alive and getattr(self, "_chat_state_painted", False):
+            return
+        was = getattr(self, "_chat_state_painted", False)
+        self._chat_alive = alive
+        self._chat_state_painted = True
+        self._paint_chat_state()
+        if was and MOTION.on:
+            t = _STUDIO["tok"] or _studio_resolve("original")
+            bg = t["ok_tint"] if alive else t["panel"]
+            def paint(c):
+                self.chat_state.configure(bg=c)
+                self.chat_state_dot.configure(bg=c)
+                self.chat_dot.configure(bg=c)
+            MOTION.color("chatstate", 800, paint, bg, frm=mix(bg, t["ok"] if alive else t["hi"], 0.45))
+
+    def _chat_live_frame(self, ph):
+        if not self._chat_alive:
+            return
+        t = _STUDIO["tok"] or _studio_resolve("original")
+        try:
+            self.chat_state_dot.configure(fg=mix(t["ok"], t["ok_tint"], 0.75 * _breath(ph)))
+        except Exception:
+            pass
+
+    def _paint_chat_state(self):
+        t = _STUDIO["tok"] or _studio_resolve("original")
+        panel = t["panel"]
+        alive = self._chat_alive
+        if alive:
+            MOTION.loop("chatlive", self._chat_live_frame, 1700, fps=30)
+        else:
+            MOTION.unloop("chatlive", rest=False)
+        bg = t["ok_tint"] if alive else panel
+        edge = t["ok_edge"] if alive else t["line"]
+        try:
+            self.chat_state.configure(bg=bg, highlightbackground=edge, highlightcolor=edge)
+            self.chat_state_dot.configure(bg=bg, fg=t["ok"] if alive else t["faint"], font=_sf("ui", 7))
+            self.chat_dot.configure(bg=bg, fg=t["ok_soft"] if alive else t["faint"], font=_sf("ui", 8, "semi"),
+                                    text="connected" if alive else "offline")
+        except Exception:
+            pass
 
     def set_tally(self, key, text, state):
         it = self._tally.get(key)
         if not it:
             return
+        if key == "chat":
+            text = str(text).upper()
         if it[2].cget("text") != text or it[3] != state:
+            changed = it[3] != state
             it[3] = state
             it[2].configure(text=text)
             self._paint_tally(key)
+            if changed and MOTION.on:
+                t = _STUDIO["tok"] or _studio_resolve("original")
+                bg = self._tally_colors(state)[0]
+                pill, dot, lbl = it[0], it[1], it[2]
+                def paint(c, pill=pill, dot=dot, lbl=lbl):
+                    pill.configure(bg=c)
+                    dot.configure(bg=c)
+                    lbl.configure(bg=c)
+                MOTION.color(("tally", key), 700, paint, bg, frm=mix(bg, t["hi"], 0.4))
+            if key == "chat":
+                if state == "onair":
+                    MOTION.loop("onair", self._onair_frame, 1900, fps=30)
+                else:
+                    MOTION.unloop("onair", rest=False)
+
+    def _onair_frame(self, ph):
+        it = self._tally.get("chat")
+        if not it or it[3] != "onair" or MOTION.busy(("tally", "chat")):
+            return
+        t = _STUDIO["tok"] or _studio_resolve("original")
+        s = _breath(ph)
+        bg = mix(t["bad"], mix(t["bad"], "#FFFFFF", 0.22), s)
+        pill, dot, lbl = it[0], it[1], it[2]
+        pill.configure(bg=bg, highlightbackground=bg, highlightcolor=bg)
+        dot.configure(bg=bg, fg=mix("#FFFFFF", mix(t["bad"], "#FFFFFF", 0.35), 1.0 - s))
+        lbl.configure(bg=bg)
+
+    def pulse(self):
+        if MOTION.ambient:
+            return
+        self._pulse = not self._pulse
+        it = self._tally.get("chat")
+        if it and it[3] == "onair":
+            t = _STUDIO["tok"] or _studio_resolve("original")
+            try:
+                it[1].configure(fg="#FFFFFF" if self._pulse else mix(t["bad"], "#FFFFFF", 0.45))
+            except Exception:
+                pass
+
+    def _tally_colors(self, state):
+        t = _STUDIO["tok"] or _studio_resolve("original")
+        if state == "onair":
+            return t["bad"], t["bad"], "#FFFFFF", "#FFFFFF"
+        if state == "ok":
+            return t["card"], t["line"], t["ok"], t["text"]
+        if state == "warn":
+            return t["warn_tint"], t["warn_edge"], t["warn"], t["hi"]
+        if state == "bad":
+            return t["bad_tint"], t["bad_edge"], t["bad"], t["hi"]
+        if state == "neutral":
+            return t["card"], t["line"], t["faint"], t["text"]
+        return t["bg"], t["line"], t["faint"], t["muted"]
 
     def _paint_tally(self, key):
         t = _STUDIO["tok"] or _studio_resolve("original")
         pill, dot, lbl, state = self._tally[key]
+        font = _sf("display", 10)
         if state == "onair":
-            bg, edge, dotc, fg = t["bad_tint"], t["bad_edge"], t["bad"], t["hi"]
+            bg, edge, dotc, fg = t["bad"], t["bad"], "#FFFFFF", "#FFFFFF"
         elif state == "ok":
             bg, edge, dotc, fg = t["card"], t["line"], t["ok"], t["text"]
         elif state == "warn":
             bg, edge, dotc, fg = t["warn_tint"], t["warn_edge"], t["warn"], t["hi"]
         elif state == "bad":
             bg, edge, dotc, fg = t["bad_tint"], t["bad_edge"], t["bad"], t["hi"]
+        elif state == "neutral":
+            bg, edge, dotc, fg = t["card"], t["line"], t["faint"], t["text"]
         else:
             bg, edge, dotc, fg = t["bg"], t["line"], t["faint"], t["muted"]
         try:
             pill.configure(bg=bg, highlightbackground=edge, highlightcolor=edge)
-            dot.configure(bg=bg, fg=dotc, font=_sf("ui", 8))
-            lbl.configure(bg=bg, fg=fg, font=_sf("display", 10))
+            dot.configure(bg=bg, fg=dotc, font=_sf("ui", 7))
+            lbl.configure(bg=bg, fg=fg, font=font)
         except Exception as _ex:
             _trace(_ex_where(), _ex)
 
@@ -3022,24 +4789,66 @@ class SidebarNav(tk.Frame):
             box._text, box._born, box._kind = text, now, kind
             bar = tk.Frame(box, width=3)
             bar.pack(side="left", fill="y")
-            msg = tk.Label(box, text=text, justify="left", anchor="w", wraplength=340, padx=12, pady=9)
-            msg.pack(side="left", fill="both", expand=True)
-            box._parts = (bar, msg)
-            for w in (box, bar, msg):
+            ttl = {"bad": "Error", "warn": "Warning", "ok": "Done"}.get(kind, "Notice")
+            inner = tk.Frame(box)
+            inner.pack(side="left", fill="both", expand=True, padx=(12, 14), pady=(9, 10))
+            head = tk.Label(inner, text=ttl, anchor="w")
+            head.pack(fill="x")
+            msg = tk.Label(inner, text=text, justify="left", anchor="w", wraplength=320)
+            msg.pack(fill="x", pady=(1, 0))
+            prog = tk.Frame(box, height=2)
+            box._prog = prog
+            box._parts = (bar, msg, head, inner)
+            box._y = None
+            box._off = 420.0 if MOTION.on else 0.0
+            box._frac = 1.0
+            box._life = ms or (8000 if kind == "bad" else 4500)
+            for w in (box, bar, msg, head, inner, prog):
                 w.bind("<Button-1>", lambda e, b=box: self._drop_toast(b))
             self._toasts.append(box)
             self._paint_toast(box)
             self._place_toasts()
-            box.after(ms or (8000 if kind == "bad" else 4500), lambda b=box: self._drop_toast(b))
+            if MOTION.on:
+                prog.place(relx=0.0, rely=1.0, anchor="sw", relwidth=1.0, height=2)
+                MOTION.tween(("toastx", str(box)), 460, lambda v, b=box: self._toast_x(b, 420.0 * (1.0 - v)), 1.0, a=0.0,
+                             ease=_ease_out_back)
+                self._toast_timer(box)
+                def _enter(e=None, b=box):
+                    MOTION.cancel(("toastlife", str(b)))
+                def _leave(e=None, b=box):
+                    if e is not None and _mo_inside(b, e):
+                        return
+                    if b in self._toasts:
+                        self._toast_timer(b)
+                box.bind("<Enter>", _enter)
+                box.bind("<Leave>", _leave)
+            else:
+                box._after_id = self.after(box._life, lambda b=box: self._drop_toast(b))
         except Exception as _ex:
             _trace(_ex_where(), _ex)
+
+    def _toast_x(self, box, off):
+        box._off = off
+        box.place_configure(x=int(-22 + off))
+
+    def _toast_timer(self, box):
+        frac = max(0.02, getattr(box, "_frac", 1.0))
+        def step(v, b=box):
+            b._frac = v
+            b._prog.place_configure(relwidth=max(0.0, v))
+        MOTION.tween(("toastlife", str(box)), box._life * frac, step, 0.0, a=frac, ease=_ease_linear,
+                     done=lambda b=box: self._drop_toast(b), slow=True, scale=False)
 
     def _paint_toast(self, box):
         t = _STUDIO["tok"] or _studio_resolve("original")
         col = {"bad": t["bad"], "warn": t["warn"], "ok": t["ok"]}.get(box._kind, t["accent"])
-        bar, msg = box._parts
-        box.configure(bg=t["raised"], highlightbackground=t["line"], highlightcolor=t["line"])
+        bar, msg, head, inner = box._parts
+        box.configure(bg=t["raised"], highlightbackground=mix(t["line"], col, 0.35), highlightcolor=t["line"])
         bar.configure(bg=col)
+        inner.configure(bg=t["raised"])
+        try: box._prog.configure(bg=mix(t["raised"], col, 0.75))
+        except Exception: pass
+        head.configure(bg=t["raised"], fg=col if t["dark"] else mix(col, "#000000", 0.25), font=_sf("ui", 8, "semi"))
         msg.configure(bg=t["raised"], fg=t["hi"], font=_sf("ui", 10))
 
     def _place_toasts(self):
@@ -3048,49 +4857,425 @@ class SidebarNav(tk.Frame):
         for box in reversed(self._toasts):
             try:
                 box.update_idletasks()
-                box.place(in_=self.main, relx=1.0, rely=0.0, x=-22, y=y, anchor="ne")
+                if box._y is None or not MOTION.on:
+                    box._y = y
+                    box.place(in_=self.main, relx=1.0, rely=0.0, x=int(-22 + box._off), y=y, anchor="ne")
+                elif abs(box._y - y) > 0.5:
+                    def step(v, b=box):
+                        b._y = v
+                        b.place_configure(y=int(round(v)))
+                    MOTION.tween(("toasty", str(box)), 300, step, float(y), a=float(box._y), ease=_ease_out_cubic)
                 box.lift()
                 y += box.winfo_reqheight() + 8
             except Exception as _ex:
                 _trace(_ex_where(), _ex)
+        try:
+            if self.palette.is_open:
+                self.palette.frame.lift()
+        except Exception:
+            pass
 
     def _drop_toast(self, box):
-        if box in self._toasts:
-            self._toasts.remove(box)
-        try: box.destroy()
-        except Exception: pass
+        if box not in self._toasts:
+            return
+        self._toasts.remove(box)
+        aid = getattr(box, "_after_id", None)
+        if aid:
+            box._after_id = None
+            try: self.after_cancel(aid)
+            except Exception: pass
+        MOTION.cancel(("toastlife", str(box)))
+        MOTION.cancel(("toasty", str(box)))
+        def kill(b=box):
+            MOTION.cancel(("toastx", str(b)))
+            try: b.destroy()
+            except Exception: pass
+        if MOTION.on:
+            MOTION.tween(("toastx", str(box)), 240, lambda v, b=box: self._toast_x(b, 440.0 * v), 1.0,
+                         a=0.0, ease=_ease_in_cubic, done=kill)
+        else:
+            kill()
         self._place_toasts()
 
-    def push_chat(self, user, msg, tag="usr"):
+    def _name_tag(self, user):
+        import zlib
+        return f"nc{zlib.crc32(str(user).lower().encode('utf-8', 'ignore')) % len(self.NAME_COLORS_DARK)}"
+
+    def push_chat(self, user, msg, tag="usr", badge=None):
         try:
             tag = tag if tag in ("usr", "cmd", "sys", "err", "mod") else "usr"
+            if self._chat_count == 0:
+                MOTION.unloop("chatempty", rest=False)
+                try: self.chat_empty.place_forget()
+                except Exception: pass
+            self._chat_count += 1
             self.chatbox.configure(state="normal")
+            line_start = self.chatbox.index("end-1c")
             self.chatbox.insert("end", time.strftime("%H:%M") + "  ", ("ts", "line"))
-            self.chatbox.insert("end", f"{user}  ", ("n_" + tag, "line"))
+            if badge:
+                btag = {"MOD": "b_mod", "OWNER": "b_own"}.get(badge, "b_sys")
+                self.chatbox.insert("end", f" {badge} ", (btag, "line"))
+                self.chatbox.insert("end", " ", ("line",))
+            name = str(user).lstrip("@")
+            ntag = self._name_tag(name) if tag in ("usr", "cmd") else "n_" + tag
+            self.chatbox.insert("end", f"{name}", (ntag, "line"))
+            self.chatbox.insert("end", "  ", ("line",))
             self.chatbox.insert("end", f"{msg}\n", ("m_" + tag, "line"))
             lines = int(self.chatbox.index("end-1c").split(".")[0])
             if lines > 400:
                 self.chatbox.delete("1.0", f"{lines-300}.0")
+            self._flash_line(line_start)
             if self.autoscroll.get(): self.chatbox.see("end")
             self.chatbox.configure(state="disabled")
+            self.chat_sub.configure(text=f"{self._chat_count} message{'s' if self._chat_count != 1 else ''} this session")
         except Exception as _ex:
             _trace(_ex_where(), _ex)
+
+    def _flash_line(self, start):
+        if not MOTION.on:
+            return
+        self._fl_i = (self._fl_i + 1) % 14
+        tag = f"fl{self._fl_i}"
+        cb = self.chatbox
+        try:
+            cb.tag_remove(tag, "1.0", "end")
+            cb.tag_add(tag, start, "end-1c")
+            cb.tag_lower(tag)
+        except Exception:
+            return
+        def step(v, tag=tag):
+            t = _STUDIO["tok"] or _studio_resolve("original")
+            cb.tag_config(tag, background=mix(mix(t["panel"], t["accent"], 0.22), t["panel"], max(0.0, min(1.0, v))))
+        def done(tag=tag):
+            cb.tag_remove(tag, "1.0", "end")
+        MOTION.tween(("chatfl", tag), 1300, step, 1.0, a=0.0, ease=_ease_in_out, done=done)
+
+    def _chat_empty_frame(self, ph):
+        if self._chat_count:
+            return
+        t = _STUDIO["tok"] or _studio_resolve("original")
+        dy = -5.0 * math.sin(2 * math.pi * ph)
+        try:
+            if self.chat_empty.winfo_ismapped():
+                self.chat_empty.place_configure(y=int(round(dy)))
+                cv = self.chat_empty_icon
+                cv.delete("all")
+                panel = t["panel"]
+                col = mix(t["faint"], t["accent_text"], 0.5 * _breath(ph))
+                _draw_icon(cv, "chat", int(20 * self._s), int(20 * self._s), 30 * self._s, col, panel, w=1.6 * self._s)
+                k = int(ph * 3 * 3) % 3
+                for i in range(3):
+                    r = 1.6 * self._s
+                    cx = (13 + i * 7) * self._s
+                    cy = 17 * self._s
+                    cv.create_oval(cx - r, cy - r, cx + r, cy + r, fill=col if i == k else mix(panel, col, 0.35), outline="")
+        except Exception:
+            pass
 
     def clear_chat(self):
         try:
             self.chatbox.configure(state="normal")
             self.chatbox.delete("1.0", "end")
             self.chatbox.configure(state="disabled")
+            self._chat_count = 0
+            self.chat_sub.configure(text="No messages yet")
+            self.chat_empty.place(relx=0.5, rely=0.42, anchor="center")
+            MOTION.loop("chatempty", self._chat_empty_frame, 2600, fps=30)
         except Exception as _ex:
             _trace(_ex_where(), _ex)
 
     def set_status(self, left=None, right=None, running=False):
         try:
-            if left is not None: self.status_left.configure(text=left)
-            if right is not None:
+            if left is not None and self.status_left.cget("text") != left:
+                self.status_left.configure(text=left)
+            if right is not None and self.status_right.cget("text") != right:
                 self.status_right.configure(text=right)
         except Exception as _ex:
             _trace(_ex_where(), _ex)
+
+
+class CommandPalette:
+
+    MAX_ROWS = 9
+
+    def __init__(self, nav, app):
+        self.nav = nav
+        self.app = app
+        self.is_open = False
+        self._rows = []
+        self._results = []
+        self._sel = 0
+        s = nav._s
+        self.frame = tk.Frame(nav, highlightthickness=1, bd=0)
+        self.frame._studio_skip_tree = True
+        top = tk.Frame(self.frame)
+        top.pack(fill="x")
+        self.top = top
+        self.icon = tk.Canvas(top, width=int(22 * s), height=int(22 * s), bd=0, highlightthickness=0)
+        self.icon.pack(side="left", padx=(16, 8), pady=int(14 * s))
+        self.var = tk.StringVar()
+        self.entry = tk.Entry(top, textvariable=self.var, bd=0, relief="flat", highlightthickness=0)
+        self.entry.pack(side="left", fill="x", expand=True, ipady=4)
+        self.esc = tk.Label(top, text="Esc", padx=6)
+        self.esc.pack(side="right", padx=(8, 14))
+        self.rule = tk.Frame(self.frame, height=1)
+        self.rule.pack(fill="x")
+        self.list = tk.Frame(self.frame)
+        self.list.pack(fill="both", expand=True, pady=6)
+        for i in range(self.MAX_ROWS):
+            row = tk.Frame(self.list, cursor="hand2")
+            kind = tk.Label(row, text="", width=6, anchor="w", cursor="hand2")
+            kind.pack(side="left", padx=(14, 4), pady=6)
+            title = tk.Label(row, text="", anchor="w", cursor="hand2")
+            title.pack(side="left", fill="x", expand=True)
+            sub = tk.Label(row, text="", anchor="e", cursor="hand2")
+            sub.pack(side="right", padx=(8, 16))
+            for w in (row, kind, title, sub):
+                w.bind("<Enter>", lambda e, k=i: self._hover(k))
+                w.bind("<Button-1>", lambda e, k=i: self._click(k))
+            self._rows.append((row, kind, title, sub))
+        self.empty = tk.Label(self.list, text="No matches", pady=14)
+        self.rule2 = tk.Frame(self.frame, height=1)
+        self.rule2.pack(fill="x")
+        self.foot = tk.Label(self.frame, text="Enter to run    Up / Down to move    Start with ! to send a command to the VM", anchor="w", padx=16, pady=7)
+        self.foot.pack(fill="x")
+        self.var.trace_add("write", lambda *a: self.refresh())
+        self.entry.bind("<Down>", lambda e: self._move(1))
+        self.entry.bind("<Up>", lambda e: self._move(-1))
+        self.entry.bind("<Tab>", lambda e: self._move(1))
+        self.entry.bind("<Return>", lambda e: self._run())
+        self.entry.bind("<KP_Enter>", lambda e: self._run())
+        self.entry.bind("<Escape>", lambda e: self.close())
+        try:
+            nav.winfo_toplevel().bind_all("<ButtonPress-1>", self._outside, add="+")
+        except Exception:
+            pass
+
+    def _outside(self, e):
+        if not self.is_open:
+            return
+        if getattr(self, "_skip_click", False):
+            self._skip_click = False
+            return
+        try:
+            w = e.widget
+            while w is not None:
+                if w is self.frame:
+                    return
+                w = getattr(w, "master", None)
+        except Exception:
+            pass
+        self.close()
+
+    def apply_tokens(self):
+        t = _STUDIO["tok"] or _studio_resolve("original")
+        bg = t["raised"] if t["dark"] else t["card"]
+        self._bg = bg
+        try:
+            self.frame.configure(bg=bg, highlightbackground=mix(t["line"], t["hi"], 0.12), highlightcolor=t["line"])
+            for w in (self.top, self.list):
+                w.configure(bg=bg)
+            self.icon.configure(bg=bg)
+            self.icon.delete("all")
+            _draw_icon(self.icon, "search", int(11 * self.nav._s), int(11 * self.nav._s), 17 * self.nav._s, t["muted"], bg, w=1.6 * self.nav._s)
+            self.entry.configure(bg=bg, fg=t["hi"], insertbackground=t["accent"], font=_sf("ui", 13),
+                                 selectbackground=t["sel"], selectforeground=t["hi"])
+            self.esc.configure(bg=mix(bg, t["hi"], 0.08), fg=t["muted"], font=_sf("mono", 8))
+            self.rule.configure(bg=t["line"])
+            self.rule2.configure(bg=t["line"])
+            self.foot.configure(bg=mix(bg, "#000000", 0.12 if t["dark"] else 0.03), fg=t["faint"], font=_sf("ui", 8))
+            self.empty.configure(bg=bg, fg=t["faint"], font=_sf("ui", 10))
+            self._paint_rows()
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
+
+    def _items(self):
+        out = []
+        for f, label in self.nav._pages:
+            grp = self.nav.GROUP_TITLES.get(self.nav.group_of(label), "")
+            out.append(("Page", label, grp, (lambda fr=f: self.nav.select(fr)), label + " " + grp))
+        try:
+            for title, sub, fn in self.app._palette_actions():
+                out.append(("Action", title, sub, fn, title + " " + sub))
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
+        return out
+
+    @staticmethod
+    def _score(q, hay, title):
+        h = hay.lower()
+        tl = title.lower()
+        if not q:
+            return 1
+        if tl.startswith(q):
+            return 100 - len(tl) * 0.1
+        if q in tl:
+            return 80 - tl.index(q)
+        if q in h:
+            return 60
+        words = [w for w in q.split() if w]
+        if words and all(w in h for w in words):
+            return 50
+        i = 0
+        for ch in h:
+            if i < len(q) and ch == q[i]:
+                i += 1
+        return 20 if i == len(q) else 0
+
+    def refresh(self):
+        raw = self.var.get().strip()
+        q = raw.lower()
+        res = []
+        pfx = getattr(self.app, "command_prefix", "!") or "!"
+        if raw.startswith("!") or (pfx != "!" and raw.startswith(pfx)):
+            cmd = raw
+            res.append(("Run", raw, "Send to the VM as owner", (lambda c=cmd: self.app._palette_run(c)), 1000))
+        scored = []
+        for kind, title, sub, fn, hay in self._items():
+            sc = self._score(q.lstrip("!"), hay, title) if not res else 0
+            if sc > 0:
+                scored.append((kind, title, sub, fn, sc + (5 if kind == "Page" else 0)))
+        scored.sort(key=lambda r: -r[4])
+        res.extend(scored)
+        self._results = res[:self.MAX_ROWS]
+        self._sel = 0
+        self._paint_rows()
+
+    def _paint_rows(self, instant=False):
+        t = _STUDIO["tok"] or _studio_resolve("original")
+        bg = getattr(self, "_bg", t["raised"])
+        selbg = mix(bg, t["accent"], 0.16)
+        for i, (row, kind, title, sub) in enumerate(self._rows):
+            if i < len(self._results):
+                k, ti, su, _fn, _sc = self._results[i]
+                on = i == self._sel
+                rb = selbg if on else bg
+                kc = {"Page": t["info"], "Action": t["accent_text"], "Run": t["ok"]}.get(k, t["muted"])
+                try:
+                    kind.configure(text=k.upper(), fg=kc, font=_sf("ui", 7, "semi"))
+                    title.configure(text=ti if len(ti) < 70 else ti[:67] + "...", fg=t["hi"], font=_sf("ui", 11, "semi" if on else "normal"))
+                    sub.configure(text=su, fg=t["muted"] if on else t["faint"], font=_sf("ui", 9))
+                    def paint(c, ws=(row, kind, title, sub)):
+                        for w in ws:
+                            w.configure(bg=c)
+                    if instant or not MOTION.on or getattr(row, "_mo_bg", None) is None:
+                        MOTION.cancel(("palrow", i))
+                        MOTION.col[("palrow", i)] = rb
+                        paint(rb)
+                    else:
+                        MOTION.color(("palrow", i), 120 if on else 200, paint, rb)
+                    row._mo_bg = rb
+                    if not row.winfo_manager():
+                        row.pack(fill="x", padx=6)
+                except Exception:
+                    pass
+            else:
+                try: row.pack_forget()
+                except Exception: pass
+        try:
+            if not self._results:
+                self.empty.pack(fill="x")
+            else:
+                self.empty.pack_forget()
+        except Exception:
+            pass
+
+    def _hover(self, i):
+        if i < len(self._results) and i != self._sel:
+            self._sel = i
+            self._paint_rows()
+
+    def _click(self, i):
+        if i < len(self._results):
+            self._sel = i
+            self._run()
+
+    def _move(self, d):
+        if self._results:
+            self._sel = (self._sel + d) % len(self._results)
+            self._paint_rows()
+        return "break"
+
+    def _run(self):
+        if not self._results:
+            return "break"
+        k, title, _sub, fn, _sc = self._results[self._sel]
+        self.close()
+        plog("PALETTE", f"{k.lower()}: {title}")
+        try:
+            fn()
+        except Exception as e:
+            log_crash(f"palette {title}", e)
+        return "break"
+
+    def open(self, from_click=False):
+        self._skip_click = bool(from_click)
+        if self.is_open:
+            self.entry.select_range(0, "end")
+            self.entry.focus_set()
+            return
+        self.is_open = True
+        self._opened_at = time.time()
+        self.apply_tokens()
+        self.var.set("")
+        self.refresh()
+        w = int(600 * self.nav._s)
+        y1 = int(92 * self.nav._s)
+        MOTION.cancel("palette")
+        for r in self._rows:
+            r[0]._mo_bg = None
+        self._paint_rows(instant=True)
+        try:
+            self.frame.place(in_=self.nav, relx=0.5, y=(y1 - 16 if MOTION.on else y1), anchor="n", width=w)
+            self.frame.lift()
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
+        if MOTION.on:
+            def step(v, y1=y1, w=w):
+                self.frame.place_configure(y=int(round(y1 - 16 * (1.0 - v))), width=int(w * (0.96 + 0.04 * min(1.0, v))))
+            MOTION.tween("palette", 260, step, 1.0, a=0.0, ease=_ease_out_back)
+            t = _STUDIO["tok"] or _studio_resolve("original")
+            for i, (row, kind, title, sub) in enumerate(self._rows):
+                if i >= len(self._results):
+                    break
+                try:
+                    _bg0 = getattr(self, "_bg", t["raised"])
+                    title.configure(fg=_bg0)
+                    sub.configure(fg=_bg0)
+                except Exception:
+                    pass
+                def fade(v, title=title, sub=sub, i=i):
+                    tt = _STUDIO["tok"] or t
+                    bg = getattr(self, "_bg", tt["raised"])
+                    vv = max(0.0, min(1.0, v))
+                    title.configure(fg=mix(bg, tt["hi"], vv))
+                    sub.configure(fg=mix(bg, tt["muted"] if i == self._sel else tt["faint"], vv))
+                MOTION.tween(("palfade", i), 220, fade, 1.0, a=0.0, delay=40 + i * 22)
+        self.entry.focus_set()
+
+    def close(self):
+        if not self.is_open:
+            return
+        self.is_open = False
+        try:
+            if self.nav.focus_get() is self.entry:
+                self.nav.winfo_toplevel().focus_set()
+        except Exception:
+            pass
+        for i in range(self.MAX_ROWS):
+            MOTION.cancel(("palfade", i))
+        if MOTION.on and self.frame.winfo_manager():
+            y1 = int(92 * self.nav._s)
+            def step(v, y1=y1):
+                self.frame.place_configure(y=int(round(y1 - 12 * v)))
+            def gone():
+                if not self.is_open:
+                    try: self.frame.place_forget()
+                    except Exception: pass
+            MOTION.tween("palette", 130, step, 1.0, a=0.0, ease=_ease_in_cubic, done=gone)
+            return
+        try: self.frame.place_forget()
+        except Exception: pass
 
 
 def _hex_to_rgb(c):
@@ -3114,12 +5299,12 @@ def mix(c1, c2, t):
     return _rgb_to_hex(r1 + (r2 - r1) * t, g1 + (g2 - g1) * t, b1 + (b2 - b1) * t)
 
 
-_STUDIO = {"tok": None, "on": False, "accent_seen": set(), "delta": 0}
+_STUDIO = {"tok": None, "on": False, "accent_seen": set(), "delta": 0, "gen": 0}
 
 _STUDIO_BASE = {
     "original": dict(name="Studio", desc="Graphite desk, amber tally accents. The default.", dark=True,
-                     bg="#121519", side="#0D1013", panel="#15191E", card="#1A1F26", raised="#242B34",
-                     line="#2D3540", input="#0E1114", hi="#F2F4F7", text="#D3D8DF", muted="#8C95A3",
+                     bg="#111418", side="#0D1014", panel="#13171C", card="#181D23", raised="#222930",
+                     line="#29313B", input="#0C0F12", hi="#F2F4F7", text="#D3D8DF", muted="#8C95A3",
                      faint="#5E6673", ok="#3DBE7E", bad="#E5484D", warn="#E9A23B", violet="#A08CF2",
                      info="#5AA9E6", accent="#F2A53A"),
     "light": dict(name="Studio light", desc="The same desk in daylight.", dark=False,
@@ -3241,6 +5426,7 @@ def _studio_resolve(name, accent=None):
         base[role + "_edge"] = mix(base["card"], base[role], 0.42 if dark else 0.38)
         base[role + "_soft"] = mix(base[role], base["hi"], 0.30) if dark else mix(base[role], "#000000", 0.18)
     base["raised_hover"] = mix(base["raised"], base["hi"], 0.07)
+    base["rail"] = mix(base["side"], "#000000", 0.30) if dark else mix(base["side"], "#000000", 0.04)
     base["border"] = base["line"]
     base["key"] = name if name in _STUDIO_BASE else "original"
     return base
@@ -3310,7 +5496,12 @@ def _studio_color(role, fallback=None):
 
 def _studio_variant(val):
     v = _hx(val)
-    if v in _STUDIO["accent_seen"] or v in ("#00e5ff", "#00b3cc"):
+    tok = _STUDIO["tok"]
+    if tok and v == _hx(tok["accent"]):
+        return "primary"
+    if v in ("#00e5ff", "#00b3cc"):
+        return "soft"
+    if v in _STUDIO["accent_seen"]:
         return "primary"
     role = _BG_ROLES.get(v)
     if role == "ok": return "go"
@@ -3325,7 +5516,7 @@ def _studio_button_colors(variant):
         return None
     if variant == "primary":
         return dict(bg=tok["accent"], fg=tok["on_accent"], border=tok["accent"], hover=tok["accent_hover"])
-    sem = {"go": "ok", "danger": "bad", "warn": "warn"}.get(variant)
+    sem = {"go": "ok", "danger": "bad", "warn": "warn", "soft": "accent"}.get(variant)
     if sem:
         return dict(bg=tok[sem + "_tint"], fg=tok[sem + "_soft"], border=tok[sem + "_edge"],
                     hover=mix(tok[sem + "_tint"], tok[sem], 0.16))
@@ -3574,6 +5765,9 @@ class RoundedButton(tk.Canvas):
         self._font = font
         self._state = state
         self._pressed = False
+        self._hv = 0.0
+        self._pv = 0.0
+        self._rip = None
         parent_bg = "#09090B"
         try:
             parent_bg = master.cget("bg")
@@ -3628,14 +5822,32 @@ class RoundedButton(tk.Canvas):
             base = mix(base, pbg, 0.45)
             border = mix(border, pbg, 0.45)
             fg = mix(fg, pbg, 0.5)
-        elif self._pressed:
-            base = mix(base, "#000000", 0.12)
-        elif self._hovering():
-            base = hov or mix(self._bg, "#ffffff", 0.10)
-            border = mix(border, "#ffffff", 0.10)
-            fg = self._hover_fg if (self._variant is None and self._hover_fg) else fg
+        else:
+            hv = max(0.0, min(1.0, self._hv if MOTION.on else (1.0 if self._hovering() else 0.0)))
+            pv = max(0.0, min(1.0, self._pv if MOTION.on else (1.0 if self._pressed else 0.0)))
+            if hv > 0:
+                base = mix(base, hov or mix(self._bg, "#ffffff", 0.10), hv)
+                border = mix(border, mix(border, "#ffffff", 0.16), hv)
+                if self._variant is None and self._hover_fg and hv > 0.5:
+                    fg = self._hover_fg
+            if pv > 0:
+                base = mix(base, "#000000", 0.14 * pv)
         r = max(2, min(int(self._radius), 6))
         self._round_rect(1, 1, w - 2, h - 2, r, fill=base, outline=border)
+        rip = self._rip
+        if rip is not None and not disabled:
+            rx, ry, rp = rip
+            far = max(math.hypot(rx - cx, ry - cy) for cx in (0, w) for cy in (0, h))
+            rr = 6 + far * rp
+            lift = mix(base, "#FFFFFF", 0.20 * (1.0 - rp)) if _lum(base) < 0.55 else mix(base, "#000000", 0.12 * (1.0 - rp))
+            pts = []
+            for k in range(28):
+                a = 2 * math.pi * k / 28.0
+                pts.append((rx + rr * math.cos(a), ry + rr * math.sin(a)))
+            poly = _clip_poly(pts, 2, 2, w - 3, h - 3)
+            if len(poly) >= 3:
+                self.create_polygon(*[c for pt in poly for c in pt], fill=lift, outline="")
+            self._round_outline(1, 1, w - 2, h - 2, r, border)
         self.create_text(w / 2, h / 2 + (1 if self._pressed else 0), text=self._text, fill=fg,
                          font=self._font, justify="center")
 
@@ -3669,28 +5881,73 @@ class RoundedButton(tk.Canvas):
         except Exception as _ex:
             _trace(_ex_where(), _ex)
 
-    def _round_outline(self, x1, y1, x2, y2, r, color):
+    def _round_outline(self, x1, y1, x2, y2, r, color, width=1):
+        r = max(0, min(r, int((y2 - y1) / 2), int((x2 - x1) / 2)))
         pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
                x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
-        self.create_polygon(pts, smooth=True, splinesteps=24, fill="", outline=color, width=2)
+        self.create_polygon(pts, smooth=True, splinesteps=24, fill="", outline=color, width=width)
+
+    def _anim(self, attr, to, dur, ease=_ease_out_cubic):
+        key = ("btn", str(self), attr)
+        def step(v, attr=attr):
+            setattr(self, attr, v)
+            self._draw()
+        MOTION.tween(key, dur, step, to, a=getattr(self, attr, 0.0), ease=ease)
 
     def _hovering(self):
         return getattr(self, "_is_hover", False)
 
     def _on_enter(self, _e=None):
-        self._is_hover = True; self._draw()
+        self._is_hover = True
+        if MOTION.on and str(self._state) != "disabled":
+            self._anim("_hv", 1.0, 130)
+        else:
+            self._hv = 1.0
+            self._draw()
 
     def _on_leave(self, _e=None):
-        self._is_hover = False; self._pressed = False; self._draw()
+        self._is_hover = False
+        was = self._pressed
+        self._pressed = False
+        if MOTION.on:
+            self._anim("_hv", 0.0, 260)
+            if was:
+                self._anim("_pv", 0.0, 200)
+        else:
+            self._hv = 0.0
+            self._pv = 0.0
+            self._draw()
 
     def _on_press(self, _e=None):
         if str(self._state) == "disabled": return
-        self._pressed = True; self._draw()
+        self._pressed = True
+        if MOTION.on:
+            self._anim("_pv", 1.0, 70)
+        else:
+            self._pv = 1.0
+            self._draw()
+
+    def _ripple(self, x, y):
+        key = ("btn", str(self), "rip")
+        def step(v, x=x, y=y):
+            self._rip = (x, y, v)
+            self._draw()
+        def done():
+            self._rip = None
+            self._draw()
+        MOTION.tween(key, 520, step, 1.0, a=0.0, ease=_ease_out_cubic, done=done)
 
     def _on_release(self, _e=None):
         if str(self._state) == "disabled": return
         was = self._pressed
-        self._pressed = False; self._draw()
+        self._pressed = False
+        if MOTION.on:
+            self._anim("_pv", 0.0, 240)
+            if was and _e is not None and MOTION.ambient:
+                self._ripple(getattr(_e, "x", self.winfo_width() // 2), getattr(_e, "y", self.winfo_height() // 2))
+        else:
+            self._pv = 0.0
+            self._draw()
         if was and callable(self._command):
             try: self._command()
             except Exception as ex:
@@ -3717,7 +5974,12 @@ class RoundedButton(tk.Canvas):
                 elif key in ("fg", "foreground"):
                     if self._variant is None or not _STUDIO["on"]:
                         self._fg = val
-                elif key == "state": self._state = val
+                elif key == "state":
+                    self._state = val
+                    if str(val) == "disabled":
+                        self._hv = 0.0
+                        self._pv = 0.0
+                        self._rip = None
                 elif key == "activebackground": self._hover = val
                 elif key == "activeforeground":
                     if self._variant is None: self._hover_fg = val
@@ -3987,6 +6249,10 @@ class ChatPlaysApp:
             self.blocked_terms = list(_dbt)
             self.twenty_four_seven_mode = self.config.get("auto_start", False)
             self.blacklisted_users = set()
+            self.b64_offenders = self._load_offenders()
+            self._tls = threading.local()
+            self._discord_token_cache = ""
+            self.discord = DiscordBridge(self)
             self.timed_bans = {}
             self.user_last_cmd = {}
             self.user_cmd_hits = {}
@@ -4055,6 +6321,16 @@ class ChatPlaysApp:
             self.start_terminal_thread()
             self.start_app_threads()
             if self.twenty_four_seven_mode and self.active_url: self.go_live()
+            try:
+                if self.config.get("discord_enabled") and self.config.get("discord_mode") != "disabled":
+                    _tok = getattr(self, "_discord_token_cache", "") or discord_token_load()
+                    if _tok:
+                        self.discord.start(_tok, self.config.get("discord_mode", "crossplay"))
+                        plog("DISCORD", "auto-starting bot (was enabled last session)")
+                    else:
+                        plog("DISCORD", "was enabled but no saved token - open the Discord page to paste it")
+            except Exception as _ex:
+                _trace(_ex_where(), _ex)
             try: self.root.after(600, self.show_welcome_guide)
             except Exception as _ex:
                 _trace(_ex_where(), _ex)
@@ -4134,6 +6410,206 @@ class ChatPlaysApp:
                     plog("BG", f"background job '{key}' done in {el*1000:.0f}ms", verbose=True)
         threading.Thread(target=_go, daemon=True, name=f"bg-{key}").start()
         return True
+
+    def _discord_exclusive(self):
+        br = getattr(self, "discord", None)
+        return bool(br is not None and br.running and br.mode == "discord")
+
+    def _b64_filter_on(self):
+        return bool(self.config.get("b64_filter", True))
+
+    def _display_text(self, message):
+        if self._b64_filter_on() and _b64_scan(message):
+            return "[blocked by base64 filter]"
+        return message
+
+    def _ingest_chat(self, user, message, is_mod=False, is_owner=False, source="discord", ref=None, display=None):
+        if not self.listening_to_chat:
+            return None
+        shown = display or user
+        text = self._display_text(message)
+        add_to_history(f"[{source}] {shown}", text, "user", is_mod, is_owner)
+        if not str(shown).startswith("["):
+            self._chat_pane_msg(f"{shown}", text, is_mod, is_owner)
+        try:
+            self.replay_buffer.append({"t": time.time(), "u": f"[{source}] {shown}", "m": text, "mod": is_mod, "owner": is_owner})
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
+        console_log("CHAT", f"[{source}] [{shown}]{' (owner)' if is_owner else (' (mod)' if is_mod else '')}: {text}")
+        append_to_all_msgs_log(f"[{source}] {shown}", text)
+        clean_user = str(user).replace("@", "").lower().strip()
+        if str(message).startswith(self.command_prefix):
+            if self._guard_payload(clean_user, message, is_owner, source=source, ref=ref):
+                return "blocked"
+            self._tls.src = (source, ref)
+            try:
+                self.parse_command(message, user, is_mod, is_owner)
+            except Exception as parse_ex:
+                console_log("ERROR", f"parse_command error ({source}): {parse_ex}\n{traceback.format_exc()}")
+            finally:
+                self._tls.src = None
+            return "cmd"
+        return "msg"
+
+    def _is_owner_name(self, clean_user, is_owner=False):
+        return bool(is_owner or clean_user in owners or clean_user == "reallyiron"
+                    or clean_user in ("[console]", "[system]"))
+
+    def _guard_payload(self, clean_user, message, is_owner, source="youtube", ref=None):
+        if not self._b64_filter_on():
+            return False
+        why = _b64_scan(message)
+        if not why:
+            return False
+        trusted = self._is_owner_name(clean_user, is_owner)
+        plog("SECURITY", f"base64 filter blocked {source}:{clean_user} - {why}" + (" (owner - not added to the block list)" if trusted else ""))
+        if trusted:
+            self.log("[system]", f"[warn] base64 filter blocked a command from {clean_user} ({why}). !tob64 turns the filter off.", "sysmsg")
+        else:
+            if clean_user not in self.b64_offenders:
+                self.b64_offenders.add(clean_user)
+                self._save_offenders()
+            self.log("[system]", f"[error] base64 blocked from {clean_user} ({why}). they can no longer send commands.", "err")
+            br = getattr(self, "discord", None)
+            if source == "discord" and br is not None:
+                br.on_blocked(clean_user, why, ref=ref)
+        self.ui(self._sync_security_marks)
+        return True
+
+    def _offenders_file(self):
+        return os.path.splitext(settings_file)[0] + "_blocked.json"
+
+    def _load_offenders(self):
+        try:
+            with open(self._offenders_file(), "r") as f:
+                data = json.load(f)
+            return set(str(x).lower() for x in data)
+        except Exception:
+            return set()
+
+    def _save_offenders(self):
+        try:
+            tmp = self._offenders_file() + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(sorted(self.b64_offenders), f)
+            os.replace(tmp, self._offenders_file())
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
+
+    def _capture_vm_png(self):
+        out = os.path.abspath(f"_vm_shot_{os.getpid()}.png")
+        be = getattr(self, "backend", "virtualbox")
+        try:
+            if be == "vmware":
+                vmw = self._vmware()
+                if not getattr(vmw, "_need", lambda: False)():
+                    return None, "VNC not connected"
+                client = vmw.client
+                if client is None or not hasattr(client, "captureScreen"):
+                    return None, "VNC capture unavailable"
+                with vmw.lock:
+                    client.captureScreen(out)
+                if os.path.exists(out) and os.path.getsize(out) > 0:
+                    return out, ""
+                return None, "capture produced no image"
+            if not self._vm_is_running():
+                return None, "VM is not running"
+            r = run_vbox(["controlvm", vm_name, "screenshotpng", out], timeout=12)
+            if r is not None and r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+                return out, ""
+            detail = ""
+            if r is not None:
+                detail = ((r.stderr or "") + (r.stdout or "")).strip()[:80]
+            return None, detail or "VBoxManage screenshotpng failed"
+        except Exception as e:
+            return None, f"{type(e).__name__}: {str(e)[:80]}"
+
+    def _discord_press(self, cmd, arg, user):
+        br = getattr(self, "discord", None)
+        if br is not None and br.running and str(user).startswith("dc_"):
+            try:
+                br.pressed(cmd, arg, user)
+            except Exception as _ex:
+                _trace(_ex_where(), _ex)
+
+    def _discord_announce(self, text):
+        br = getattr(self, "discord", None)
+        if br is not None and br.running:
+            try:
+                br.announce(text)
+            except Exception as _ex:
+                _trace(_ex_where(), _ex)
+
+    def toggle_crossplay(self):
+        br = self.discord
+        if br.running:
+            br.stop()
+            self.config["discord_enabled"] = False
+            self.save_settings()
+            self.toast("Discord bot stopped.", "ok")
+            self._refresh_discord_page()
+            return
+        token = ""
+        try:
+            token = self.discord_token_entry.get().strip()
+        except Exception:
+            pass
+        if token and token != self._discord_token_mask():
+            saved_enc = discord_token_save(token)
+            self._discord_token_cache = token
+            plog("DISCORD", "token saved" + (" (encrypted with DPAPI)" if saved_enc else " (plaintext - not on Windows)"))
+        else:
+            token = getattr(self, "_discord_token_cache", "") or discord_token_load()
+        if not token:
+            self.toast("Paste your bot token first.", "bad")
+            self._set_discord_hint("Paste the bot token from the Developer Portal, then press the button again.", "bad")
+            return
+        mode = getattr(self, "_discord_mode_var", None)
+        mode = mode.get() if mode is not None else "crossplay"
+        self.config["discord_enabled"] = True
+        self.config["discord_mode"] = mode
+        self.save_settings()
+        br.start(token, mode)
+        if mode == "crossplay":
+            url = str(self.config.get("youtube_url", "") or "").strip()
+            if url and not (getattr(self, "listening_to_chat", False) and getattr(self, "active_url", "")):
+                try:
+                    self.go_live()
+                    plog("DISCORD", "crossplay - also connecting YouTube chat")
+                except Exception as _ex:
+                    _trace(_ex_where(), _ex)
+        self.toast(f"Starting Discord bot ({br.mode_label()}).", "ok")
+        self._refresh_discord_page()
+
+    def _discord_token_mask(self):
+        return "\u2022" * 24
+
+    def save_discord_token(self):
+        try:
+            token = self.discord_token_entry.get().strip()
+        except Exception:
+            return
+        if token == self._discord_token_mask():
+            return
+        if not token:
+            discord_token_save("")
+            self._discord_token_cache = ""
+            self._set_discord_hint("Saved token removed.", "ok")
+            self.toast("Bot token removed.", "ok")
+            return
+        enc = discord_token_save(token)
+        self._discord_token_cache = token
+        self._set_discord_hint("Token saved" + (" and encrypted with Windows DPAPI." if enc else " (stored in plain text - Windows encrypts it automatically)."), "ok")
+        self.toast("Bot token saved.", "ok")
+
+    def _set_discord_hint(self, text, kind="muted"):
+        if not hasattr(self, "_discord_hint"):
+            return
+        col = {"ok": "ok", "bad": "bad", "warn": "warn"}.get(kind, "muted")
+        try:
+            self._discord_hint.configure(text=text, fg=_studio_color(col, "#A1A1AA"))
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
 
     def _vm_is_running(self):
         _c = getattr(self, "_vmrun_cache", None)
@@ -4334,7 +6810,10 @@ class ChatPlaysApp:
             "enable_chat": True, "strict_live_check": True, "keyboard_layout": "US", "command_prefix": "!",
             "stats_interval": 15, "typing_speed": 0.015, "key_delay": 0.015, "mouse_delay": 0.005,
             "enable_starting_scene": True, "app_name": "YT2VM", "ultra_speed": False, "osvoting_enabled": False, "ui_theme": "original", "auto_recover": True, "low_power": False, "snippets": [], "sound_sources": [], "backend": "virtualbox", "allow_viewer_shell": False, "protect_vm": False, "rate_limit_enabled": True, "use_customtkinter": False, "use_ttkbootstrap": True, "viewer_cooldown": 1.5, "viewer_rate_limit": 7, "max_type_len": 200, "flask_bind_lan": False, "vmx_path": "", "vnc_keymap": "us", "vmware_settle": 1.0, "vnc_host": "127.0.0.1", "auto_kill_vnc": True, "altgr_mode": "alt_r",
-            "custom_commands": {}
+            "custom_commands": {},
+            "b64_filter": True, "discord_enabled": False, "discord_mode": "crossplay",
+            "discord_guild_id": "", "discord_channel_id": "", "discord_log_channel_id": "",
+            "discord_owner_ids": "", "discord_screens": True, "discord_log_all": True
         }
         if os.path.exists(settings_file):
             try:
@@ -4415,6 +6894,11 @@ class ChatPlaysApp:
         try: _jlog_flush()
         except Exception: pass
         self.running = False
+        try:
+            if getattr(self, "discord", None) is not None:
+                self.discord.stop()
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
         save_stats()
         try:
             if hasattr(self, 'shared_session') and self.shared_session:
@@ -4595,54 +7079,107 @@ class ChatPlaysApp:
             self.tabview.add(self.tab_vms, text="  VMS  ")
             self.tab_diag = ttk.Frame(self.tabview, style="TFrame")
             self.tabview.add(self.tab_diag, text="  Diagnostics  ")
+            self.tab_discord = ttk.Frame(self.tabview, style="TFrame")
+            self.tabview.add(self.tab_discord, text="  Discord  ")
 
             t = self._tok
             def _f(parent, role="bg", **kw):
                 fr = tk.Frame(parent, bg=t[role], **kw)
                 fr._st = {"bg": role}
                 return fr
-            tiles = _f(self.tab_dash)
-            tiles.pack(side="top", fill="x", padx=24, pady=(18, 0))
+            S = getattr(self, "_ui_scale", 1.0)
+            self._dash_hist = {k: collections.deque(maxlen=150) for k in ("viewers", "queue", "cpm")}
+            self._dash_cmdlog = collections.deque(maxlen=400)
+            self._repaint_hooks = getattr(self, "_repaint_hooks", [])
+
+            metrics = _f(self.tab_dash)
+            metrics.pack(side="top", fill="x", padx=24, pady=(20, 0))
+            self._metric = {}
+            for i, (key, title, sub) in enumerate((("viewers", "Viewers", "0 likes"),
+                                                   ("queue", "Command queue", "Nobody waiting"),
+                                                   ("cpm", "Commands / min", "0 run  /  0 failed"),
+                                                   ("uptime", "Uptime", "Success rate 100%"))):
+                outer, card = self._st_card(metrics)
+                outer.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 12, 0))
+                metrics.columnconfigure(i, weight=1, uniform="metric")
+                top = _f(card, "card")
+                top.pack(fill="x", padx=16, pady=(13, 0))
+                self._st_label(top, title, fg="muted", font=("ui", 9, "semi")).pack(side="left")
+                trend = self._st_label(top, "", fg="faint", font=("ui", 8))
+                trend.pack(side="right")
+                val = self._st_label(card, "0", fg="hi", font=("display", 23), anchor="w")
+                val.pack(fill="x", padx=16, pady=(2, 0))
+                sl = self._st_label(card, sub, fg="faint", font=("ui", 8), anchor="w")
+                sl.pack(fill="x", padx=16)
+                cv = tk.Canvas(card, height=int(34 * S), bd=0, highlightthickness=0, bg=t["card"])
+                cv._studio_skip = True
+                cv.pack(fill="x", padx=0, pady=(8, 0))
+                cv.bind("<Configure>", lambda e: self._draw_sparks())
+                self._metric[key] = {"val": val, "sub": sl, "cv": cv, "trend": trend}
+            self.lbl_viewers_val = self._metric["viewers"]["val"]
+            self.lbl_likes_val = self._metric["viewers"]["sub"]
+            self.lbl_uptime_val = self._metric["uptime"]["val"]
+            self.lbl_cmds_val = self._metric["cpm"]["sub"]
+
+            hoo, health = self._st_card(self.tab_dash)
+            hoo.pack(side="top", fill="x", padx=24, pady=(12, 0))
+            hrow = _f(health, "card")
+            hrow.pack(fill="x")
             self._tiles = {}
-            self._tile_cards = []
-            for i, (name, sub) in enumerate((("Bot Status", "Chat"), ("VM", "Machine"),
-                                             ("Overlay Server", "Web"), ("Real PC", "Pico"))):
-                outer, card = self._st_card(tiles)
-                outer.grid(row=0, column=i, sticky="we", padx=(0 if i == 0 else 12, 0))
-                nice = {"Bot Status": "Chat bot", "VM": "Virtual machine", "Overlay Server": "Overlay server", "Real PC": "Real PC"}[name]
-                self._st_label(card, nice, fg="muted", font=("ui", 9)).pack(anchor="w", padx=16, pady=(12, 0))
-                v = self._st_label(card, "Stopped", fg="muted", font=("display", 17))
-                v.pack(anchor="w", padx=16, pady=(0, 12))
-                self._tiles[name] = v
-                self._tile_cards.append(outer)
-                tiles.columnconfigure(i, weight=1, uniform="tile")
+            self._tile_dots = {}
+            self._tile_cards = [hoo]
+            cells = (("Bot Status", "Chat bot"), ("VM", "Virtual machine"), ("Discord", "Discord"), ("OBS", "OBS"),
+                     ("Overlay Server", "Overlay server"), ("Real PC", "Real PC"))
+            for i, (key, nice) in enumerate(cells):
+                if i:
+                    sep = _f(hrow, "line", width=1)
+                    sep.grid(row=0, column=i * 2 - 1, sticky="ns", pady=10)
+                cell = _f(hrow, "card")
+                cell.grid(row=0, column=i * 2, sticky="we", padx=16, pady=10)
+                hrow.columnconfigure(i * 2, weight=1, uniform="health")
+                dot = self._st_label(cell, "\u25cf", fg="faint", font=("ui", 9))
+                dot.pack(side="left", padx=(0, 8))
+                txt = _f(cell, "card")
+                txt.pack(side="left", fill="x")
+                self._st_label(txt, nice, fg="muted", font=("ui", 8), anchor="w").pack(anchor="w")
+                v = self._st_label(txt, "Stopped", fg="text", font=("ui", 10, "semi"), anchor="w")
+                v.pack(anchor="w")
+                self._tiles[key] = v
+                self._tile_dots[key] = dot
 
             body = _f(self.tab_dash)
-            body.pack(side="top", fill="both", expand=True, padx=24, pady=18)
-            left_host = _f(body, width=int(372 * getattr(self, "_ui_scale", 1.0)))
+            body.pack(side="top", fill="both", expand=True, padx=24, pady=(12, 18))
+            left_host = _f(body, width=int(352 * S))
             left_host.pack(side="left", fill="y")
             left_host.pack_propagate(False)
             dash_left = self.make_scrollable(left_host)
             dash_right = _f(body)
-            dash_right.pack(side="left", fill="both", expand=True, padx=(18, 0))
+            dash_right.pack(side="left", fill="both", expand=True, padx=(14, 0))
 
             o1, conn_card = self._st_card(dash_left, "Stream")
-            o1.pack(fill="x", pady=(0, 14), padx=(0, 10))
-            self._st_label(conn_card, "YouTube link, channel @handle or video URL", fg="muted", font=("ui", 9)).pack(anchor="w", padx=16)
+            o1.pack(fill="x", pady=(0, 12), padx=(0, 10))
+            self._st_label(conn_card, "YouTube link, @handle or video ID", fg="muted", font=("ui", 9)).pack(anchor="w", padx=16)
             self.entry_url = tk.Entry(conn_card, font=_sf("ui", 10), bg=t["input"], fg=t["hi"], insertbackground=t["hi"], bd=0,
                                       highlightthickness=1, highlightbackground=t["line"], highlightcolor=t["accent"])
             self.entry_url.pack(fill="x", padx=16, pady=(6, 10), ipady=7)
             self.entry_url.insert(0, self.config.get("youtube_url", "@yourchannel"))
             self.entry_url.bind("<Return>", lambda e: self.go_live())
             self.btn_connect = self._st_button(conn_card, "Connect chat", self.go_live, "primary")
-            self.btn_connect.pack(fill="x", padx=16, pady=(0, 16))
+            self.btn_connect.pack(fill="x", padx=16, pady=(0, 10))
+            srow = _f(conn_card, "card")
+            srow.pack(fill="x", padx=16, pady=(0, 14))
+            self._stream_dot = self._st_label(srow, "\u25cf", fg="faint", font=("ui", 8))
+            self._stream_dot.pack(side="left")
+            self._stream_state = self._st_label(srow, "Not connected", fg="faint", font=("ui", 9), anchor="w")
+            self._stream_state.pack(side="left", padx=(6, 0))
 
             o2, status_card = self._st_card(dash_left, "Machine")
-            o2.pack(fill="x", pady=(0, 14), padx=(0, 10))
+            o2.pack(fill="x", pady=(0, 12), padx=(0, 10))
             self.lbl_status = self._st_label(status_card, "Booting", fg="ok", font=("display", 15), anchor="w")
             self.lbl_status.pack(fill="x", padx=16)
-            self.btn_vm = self._st_button(status_card, f"target: {vm_name}", self.cycle_vm, "neutral", 9)
-            self.btn_vm.pack(fill="x", padx=16, pady=(8, 12))
+            self._st_label(status_card, "Target VM  /  click to cycle", fg="faint", font=("ui", 8), anchor="w").pack(fill="x", padx=16, pady=(8, 0))
+            self.btn_vm = self._st_button(status_card, f"{vm_name}", self.cycle_vm, "neutral", 9)
+            self.btn_vm.pack(fill="x", padx=16, pady=(4, 10))
             grid = _f(status_card, "card")
             grid.pack(fill="x", padx=12, pady=(0, 14))
             for c in range(2):
@@ -4659,7 +7196,7 @@ class ChatPlaysApp:
                 self._st_button(grid, lbl, fn, var, 9).grid(row=i // 2, column=i % 2, sticky="we", padx=4, pady=4)
 
             o3, tools_card = self._st_card(dash_left, "Chat control")
-            o3.pack(fill="x", pady=(0, 14), padx=(0, 10))
+            o3.pack(fill="x", pady=(0, 6), padx=(0, 10))
             tg = _f(tools_card, "card")
             tg.pack(fill="x", padx=12, pady=(0, 14))
             for c in range(2):
@@ -4670,45 +7207,42 @@ class ChatPlaysApp:
                                            ("Minimize", self._minimize_window))):
                 self._st_button(tg, lbl, fn, "neutral", 9).grid(row=i // 2, column=i % 2, sticky="we", padx=4, pady=4)
 
-            o4, stats_card = self._st_card(dash_left, "Session")
-            o4.pack(fill="x", pady=(0, 6), padx=(0, 10))
-            stat_grid = _f(stats_card, "card")
-            stat_grid.pack(fill="x", padx=16, pady=(0, 14))
-            stat_grid.columnconfigure(1, weight=1)
-            vals = []
-            for r, (lbl, init, fg) in enumerate((("Uptime", "0h 0m 0s", "hi"), ("Commands run", "0 (0 failed)", "hi"),
-                                                  ("Viewers", "0", "accent"), ("Likes", "0", "hi"))):
-                self._st_label(stat_grid, lbl, fg="muted", font=("ui", 10)).grid(row=r, column=0, sticky="w", pady=3)
-                v = self._st_label(stat_grid, init, fg=fg, font=("display", 12))
-                v.grid(row=r, column=1, sticky="e", pady=3)
-                vals.append(v)
-            self.lbl_uptime_val, self.lbl_cmds_val, self.lbl_viewers_val, self.lbl_likes_val = vals
-
-            chead = _f(dash_right)
-            chead.pack(fill="x", pady=(0, 8))
-            self._st_label(chead, "Console", bg="bg", fg="hi", font=("display", 13)).pack(side="left")
-            def _clear_console():
-                try:
-                    self.console_text.configure(state="normal")
-                    self.console_text.delete("1.0", "end")
-                    self.console_text.configure(state="disabled")
-                except Exception as _ex:
-                    _trace(_ex_where(), _ex)
-            self._st_button(chead, "Clear", _clear_console, "neutral", 9).pack(side="right")
-            console_border = _f(dash_right, "line")
+            co, ccard = self._st_card(dash_right)
+            co.pack(fill="both", expand=True)
+            chead = _f(ccard, "card")
+            chead.pack(fill="x", padx=16, pady=(12, 10))
+            self._st_label(chead, "Console", fg="hi", font=("display", 13)).pack(side="left")
+            self._st_button(chead, "Clear", self._clear_console, "neutral", 9).pack(side="right")
+            chips = _f(chead, "card")
+            chips.pack(side="right", padx=(0, 10))
+            self._console_filter = "all"
+            self._console_chips = {}
+            for key, txt in (("all", "All"), ("chat", "Chat"), ("system", "System"), ("errors", "Errors")):
+                ch = tk.Label(chips, text=txt, padx=10, pady=3, cursor="hand2")
+                ch._studio_skip = True
+                ch.pack(side="left", padx=(4, 0))
+                ch.bind("<Button-1>", lambda e, k=key: self._set_console_filter(k))
+                self._console_chips[key] = ch
+            self._repaint_hooks.append(self._paint_console_chips)
+            crule = _f(ccard, "line", height=1)
+            crule.pack(fill="x")
+            cmd_frame = _f(ccard, "card")
+            cmd_frame.pack(side="bottom", fill="x", padx=12, pady=12)
+            crule2 = _f(ccard, "line", height=1)
+            crule2.pack(side="bottom", fill="x")
+            console_border = _f(ccard, "input")
             console_border.pack(fill="both", expand=True)
             self.console_text = scrolledtext.ScrolledText(console_border, font=_sf("mono", 10), bg=t["input"], fg=t["text"], bd=0,
-                                                          highlightthickness=0, insertbackground=t["hi"], padx=14, pady=12,
-                                                          spacing1=1, spacing3=2, wrap="word")
-            self.console_text._st = {"bg": "input", "fg": "text", "font": ("mono", 10)}
-            self.console_text.pack(fill="both", expand=True, padx=1, pady=1)
+                                                          highlightthickness=0, insertbackground=t["hi"], padx=16, pady=12,
+                                                          spacing1=1, spacing3=3, wrap="word", height=6, width=40)
+            self.console_text._st = {"bg": "input", "fg": "text", "font": ("mono", 9)}
+            self.console_text.pack(fill="both", expand=True)
             self.console_text.configure(state='disabled')
             self.console_text.tag_config("SYSTEM", foreground="#10B981")
             self.console_text.tag_config("ERROR", foreground="#EF4444", font=("Consolas", 10, "bold"))
             self.console_text.tag_config("EXEC", foreground="#A78BFA")
             self.console_text.tag_config("CHAT", foreground="#A1A1AA")
-            cmd_frame = _f(dash_right)
-            cmd_frame.pack(fill="x", pady=(12, 0))
+            self.console_text.tag_config("OTHER", foreground="#D4D4D8")
             cmd_box = _f(cmd_frame, "line")
             cmd_box.pack(side="left", fill="x", expand=True)
             cmd_inner = _f(cmd_box, "input")
@@ -4719,17 +7253,89 @@ class ChatPlaysApp:
             self.entry_cmd._st = {"bg": "input", "fg": "hi", "font": ("mono", 11), "plain": True}
             self.entry_cmd.pack(side="left", fill="x", expand=True, ipady=8, padx=(0, 8))
             self.entry_cmd.bind("<Return>", self.on_manual_cmd)
+            self.entry_cmd.bind("<Up>", lambda e: self._cmd_history(-1))
+            self.entry_cmd.bind("<Down>", lambda e: self._cmd_history(1))
+            self._cmd_hist = []
+            self._cmd_hist_i = 0
+            self._cmd_hint = self._st_label(cmd_inner, "!type hello    Up / Down for history", bg="input", fg="faint", font=("mono", 10), anchor="w")
+            self._cmd_hint.bind("<Button-1>", lambda e: self.entry_cmd.focus_set())
+            def _hint(e=None):
+                try:
+                    if self.entry_cmd.get() or self.root.focus_get() is self.entry_cmd:
+                        self._cmd_hint.place_forget()
+                    else:
+                        self._cmd_hint.place(in_=self.entry_cmd, x=2, rely=0.5, anchor="w")
+                except Exception as _ex:
+                    _trace(_ex_where(), _ex)
+            self._cmd_hint_update = _hint
+            for ev in ("<FocusIn>", "<FocusOut>", "<KeyRelease>"):
+                self.entry_cmd.bind(ev, _hint, add="+")
+            self.root.after(300, _hint)
             self._st_button(cmd_frame, "Run", self.on_manual_cmd, "primary").pack(side="right", padx=(10, 0), fill="y")
-
-            self.lbl_music_playing = tk.Label(self.tab_music, text="NO MUSIC PLAYING", bg="#09090B", fg="#B026FF", font=("Consolas", 36, "bold"))
-            self.lbl_music_playing.pack(pady=40)
-            self.music_listbox = tk.Listbox(self.tab_music, bg="#18181B", fg="#00E5FF", font=("Consolas", 14), bd=0, highlightthickness=0)
-            self.music_listbox.pack(fill="both", expand=True, padx=40, pady=20)
-            def auto_resize_music_text(event):
-                w = event.width
-                new_size = max(12, min(48, int(w / 22)))
-                self.lbl_music_playing.config(font=("Consolas", new_size, "bold"))
-            self.tab_music.bind("<Configure>", auto_resize_music_text)
+            mwrap = _f(self.tab_music)
+            mwrap.pack(fill="both", expand=True, padx=24, pady=20)
+            mo, mnow = self._st_card(mwrap)
+            mo.pack(fill="x")
+            mrow = _f(mnow, "card")
+            mrow.pack(fill="x", padx=18, pady=18)
+            self._music_art = tk.Canvas(mrow, width=int(64 * S), height=int(64 * S), bd=0, highlightthickness=0, bg=t["card"])
+            self._music_art._studio_skip = True
+            self._music_art.pack(side="left")
+            mtxt = _f(mrow, "card")
+            mtxt.pack(side="left", fill="x", expand=True, padx=(16, 10))
+            self._st_label(mtxt, "Now playing", fg="muted", font=("ui", 9, "semi"), anchor="w").pack(anchor="w")
+            self.lbl_music_playing = self._st_label(mtxt, "Nothing playing", fg="hi", font=("display", 18), anchor="w")
+            self.lbl_music_playing.pack(anchor="w", fill="x")
+            self.lbl_music_by = self._st_label(mtxt, "Viewers queue songs with !music <url>", fg="faint", font=("ui", 9), anchor="w")
+            self.lbl_music_by.pack(anchor="w")
+            mctl = _f(mrow, "card")
+            mctl.pack(side="right")
+            for _txt, _fn, _var in (("Play", lambda: self.obs_media_action("OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PLAY"), "neutral"),
+                                    ("Pause", lambda: self.obs_media_action("OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PAUSE"), "neutral"),
+                                    ("Skip", self._skip_song, "soft")):
+                self._st_button(mctl, _txt, _fn, _var, 9).pack(side="left", padx=(6, 0))
+            mo2, mnext = self._st_card(mwrap, "Up next")
+            mo2.pack(fill="both", expand=True, pady=(12, 0))
+            mlist = _f(mnext, "card")
+            mlist.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+            self.music_listbox = tk.Listbox(mlist, bg=t["card"], fg=t["text"], font=_sf("ui", 11), bd=0, highlightthickness=0,
+                                            activestyle="none")
+            self.music_listbox._st = {"bg": "card", "fg": "text", "font": ("ui", 11)}
+            self.music_listbox.pack(fill="both", expand=True, padx=6)
+            self._music_empty = self._st_label(mlist, "The queue is empty", fg="faint", font=("ui", 10))
+            self._music_empty.place(relx=0.5, rely=0.4, anchor="center")
+            def _paint_art(ph=None):
+                cv = self._music_art
+                tk_ = self._tok
+                cv.delete("all")
+                cv.configure(bg=tk_["card"])
+                w = int(64 * S)
+                playing = bool(getattr(self, "current_song", None))
+                glow = 0.0 if ph is None else _breath(ph * 2 % 1.0)
+                _rrect(cv, 1, 1, w - 1, w - 1, 12 * S, fill=tk_["accent_tint"],
+                       outline=mix(tk_["accent_edge"], tk_["accent"], 0.6 * glow))
+                if playing and ph is not None and MOTION.ambient:
+                    n = 5
+                    bw = 5 * S
+                    gap = 3.5 * S
+                    total = n * bw + (n - 1) * gap
+                    x0 = (w - total) / 2.0
+                    base = w - 16 * S
+                    maxh = w - 32 * S
+                    for i in range(n):
+                        a = abs(math.sin(2 * math.pi * (ph * (1.0 + i * 0.37) + i * 0.21)))
+                        b = abs(math.sin(2 * math.pi * (ph * (2.1 - i * 0.23) + i * 0.53)))
+                        hh = maxh * (0.18 + 0.82 * (0.6 * a + 0.4 * b))
+                        x = x0 + i * (bw + gap)
+                        _rrect(cv, x, base - hh, x + bw, base, 2 * S, fill=mix(tk_["accent_text"], tk_["hi"], 0.15 * (i % 2)), outline="")
+                else:
+                    _draw_icon(cv, "note", w / 2.0, w / 2.0, 30 * S, tk_["accent_text"], tk_["accent_tint"], w=2.0 * S)
+            self._paint_music_art = _paint_art
+            def _eq(ph):
+                if getattr(self.tabview, "_current", None) is self.tab_music:
+                    _paint_art(ph)
+            self._music_eq = _eq
+            self._repaint_hooks.append(_paint_art)
 
             vbox_wrapper = tk.Frame(self.tab_vbox, bg="#09090B")
             vbox_wrapper.pack(fill="both", expand=True)
@@ -4887,9 +7493,10 @@ class ChatPlaysApp:
             btn_save_frame = tk.Frame(sett_content, bg="#18181B")
             btn_save_frame.pack(fill="x", pady=(20, 0))
             tk.Button(btn_save_frame, text="SAVE ALL SETTINGS", font=("Segoe UI", 11, "bold"), bg=self.accent_main, fg="black", activebackground=self.accent_hover, activeforeground="black", bd=0, cursor="hand2", command=self.save_general_settings).pack(ipady=8, ipadx=40)
-            for _tab in ("build_extra_tab", "build_osvoting_tab", "build_realpc_tab", "build_automation_tab", "build_eventlog_tab", "build_appearance_tab", "build_obs_tab", "build_keys_tab", "build_mouse_tab", "build_macros_tab", "build_moderation_tab", "build_snapshots_tab", "build_overlays_tab", "build_chattools_tab", "build_system_tab", "build_replay_tab", "build_media_tab", "build_quicktype_tab", "build_winapps_tab", "build_backup_tab", "build_help_tab", "build_vms_tab", "build_diagnostics_tab"):
+            for _tab in ("build_extra_tab", "build_osvoting_tab", "build_realpc_tab", "build_automation_tab", "build_eventlog_tab", "build_appearance_tab", "build_obs_tab", "build_keys_tab", "build_mouse_tab", "build_macros_tab", "build_moderation_tab", "build_snapshots_tab", "build_overlays_tab", "build_chattools_tab", "build_system_tab", "build_replay_tab", "build_media_tab", "build_quicktype_tab", "build_winapps_tab", "build_backup_tab", "build_help_tab", "build_vms_tab", "build_diagnostics_tab", "build_discord_tab"):
                 self._build_tab(_tab)
             self._bind_secret_replay()
+            self._promote_page_titles()
             self._studio_finish()
         except Exception as e:
             self.log("[system]", f"[error] ui build error: {e}", "err")
@@ -5371,6 +7978,12 @@ class ChatPlaysApp:
             kw.pop("foreground", None)
         elif cls in ("Frame", "Toplevel", "Labelframe"):
             kw.pop("foreground", None) if cls != "Labelframe" else None
+            if (cls == "Frame" and not ex and newbg and _hx(newbg) == _hx(t["card"])
+                    and _hx(pbg) in (_hx(t["bg"]), _hx(t["panel"]))):
+                kw.update(highlightthickness=1, highlightbackground=t["line"], highlightcolor=t["line"])
+                if not getattr(x, "_mo_glow", False):
+                    x._mo_glow = True
+                    _mo_border_glow(x)
         try:
             x.configure(**kw)
         except Exception:
@@ -5424,12 +8037,42 @@ class ChatPlaysApp:
     def _on_page_shown(self, page):
         if getattr(self, "_studio_ready", False):
             self._st_walk(page, self._tok["bg"], False)
+        if page is getattr(self, "tab_dash", None):
+            self._dash_enter()
+        else:
+            MOTION.unloop("sparkpulse", rest=False)
+            MOTION.unloop("health", rest=True)
+            for _c in getattr(self, "_metric", {}).values():
+                try: _c["cv"].delete("pulse")
+                except Exception: pass
 
     def _register_scroll(self, canvas):
         try:
             self._scroll_canvases.add(str(canvas))
         except Exception:
             pass
+
+    def _smooth_scroll(self, cv, d):
+        try:
+            sr = [float(x) for x in str(cv.cget("scrollregion")).split()]
+            total = (sr[3] - sr[1]) if len(sr) == 4 else 0.0
+            view = float(cv.winfo_height())
+        except Exception:
+            total = 0.0
+            view = 0.0
+        if not MOTION.on or total <= view or total <= 0:
+            cv.yview_scroll(d * 3, "units")
+            return
+        key = ("scroll", str(cv))
+        first = float(cv.yview()[0])
+        pend = getattr(self, "_scroll_targets", {})
+        self._scroll_targets = pend
+        base = pend.get(key, first) if MOTION.busy(key) else first
+        step_px = 64.0 * abs(d)
+        target = base + (step_px if d > 0 else -step_px) / total
+        target = max(0.0, min(1.0 - view / total, target))
+        pend[key] = target
+        MOTION.tween(key, 220, lambda v, c=cv: c.yview_moveto(v), target, a=first, ease=_ease_out_cubic)
 
     def _wheel_router(self, e):
         try:
@@ -5457,7 +8100,7 @@ class ChatPlaysApp:
                     else:
                         d = -1 if e.delta > 0 else 1
                         d *= max(1, abs(int(e.delta)) // 120)
-                    w.yview_scroll(d * 3, "units")
+                    self._smooth_scroll(w, d)
                 except Exception as _ex:
                     _trace(_ex_where(), _ex)
                 return "break"
@@ -5471,14 +8114,34 @@ class ChatPlaysApp:
         try:
             self.root.bind_all("<Control-k>", nav.focus_search)
             self.root.bind_all("<Control-K>", nav.focus_search)
+            self.root.bind_all("<Control-p>", nav.focus_search)
+            self.root.bind_all("<Control-j>", nav.toggle_chat_pane)
+            self.root.bind_all("<Control-J>", nav.toggle_chat_pane)
             self.root.bind_all("<Control-Tab>", lambda e: (nav.step(1), "break")[1])
+            _orig_next = str(self.root.bind_all("<<NextWindow>>") or "")
+            def _next_window(e):
+                try:
+                    st = int(e.state) if str(e.state).isdigit() else 0
+                except Exception:
+                    st = 0
+                if st & 0x4:
+                    nav.step(1)
+                    return "break"
+                if _orig_next:
+                    try:
+                        self.root.tk.eval(_orig_next.replace("%W", str(e.widget)))
+                    except Exception as _ex:
+                        _trace(_ex_where(), _ex)
+                return "break"
+            self.root.bind_all("<<NextWindow>>", _next_window)
             self.root.bind_all("<Control-Shift-Tab>", lambda e: (nav.step(-1), "break")[1])
             try: self.root.bind_all("<Control-ISO_Left_Tab>", lambda e: (nav.step(-1), "break")[1])
             except Exception: pass
             def _focus_cmd(e=None):
                 try:
+                    nav.palette.close()
                     nav.select(self.tab_dash)
-                    self.entry_cmd.focus_set()
+                    self.root.after(40, self.entry_cmd.focus_set)
                 except Exception as _ex:
                     _trace(_ex_where(), _ex)
                 return "break"
@@ -5487,6 +8150,246 @@ class ChatPlaysApp:
         except Exception as _ex:
             _trace(_ex_where(), _ex)
 
+    def _run_repaint_hooks(self):
+        for fn in list(getattr(self, "_repaint_hooks", [])):
+            try:
+                fn()
+            except Exception as _ex:
+                _trace(_ex_where(), _ex)
+        try: self._draw_sparks()
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
+
+    def _promote_page_titles(self):
+        self._page_desc = {}
+        nav = getattr(self, "tabview", None)
+        if nav is None:
+            return
+        hidden = 0
+        for frame, label in nav._pages:
+            try:
+                stack = [frame]
+                order = []
+                while stack and len(order) < 60:
+                    w = stack.pop(0)
+                    order.append(w)
+                    stack = list(w.winfo_children()) + stack
+                title = None
+                for w in order:
+                    if w.winfo_class() != "Label":
+                        continue
+                    try:
+                        parts = self.root.tk.splitlist(str(w.cget("font")))
+                        size = abs(int(parts[1])) if len(parts) > 1 else 0
+                        bold = any(str(x).lower() == "bold" for x in parts[2:])
+                    except Exception:
+                        continue
+                    txt = str(w.cget("text")).strip()
+                    if bold and 13 <= size <= 16 and txt and txt.upper() == txt and sum(c.isalpha() for c in txt) >= 3:
+                        title = w
+                    break
+                if title is None:
+                    continue
+                parent = title.master
+                mgr = title.winfo_manager()
+                desc = None
+                if mgr == "pack":
+                    sl = parent.pack_slaves()
+                    if title in sl:
+                        i = sl.index(title)
+                        if i + 1 < len(sl) and sl[i + 1].winfo_class() == "Label":
+                            nx = sl[i + 1]
+                            try:
+                                np_ = self.root.tk.splitlist(str(nx.cget("font")))
+                                nsize = abs(int(np_[1])) if len(np_) > 1 else 0
+                                nbold = any(str(x).lower() == "bold" for x in np_[2:])
+                            except Exception:
+                                nsize, nbold = 0, True
+                            ntxt = str(nx.cget("text")).strip()
+                            if nsize <= 10 and not nbold and len(ntxt) > 20:
+                                desc = nx
+                    first = sl and sl[0] is title
+                    title.pack_forget()
+                    if desc is not None:
+                        self._page_desc[label] = " ".join(str(desc.cget("text")).split())
+                        desc.pack_forget()
+                    if first:
+                        rest = parent.pack_slaves()
+                        if rest:
+                            sp = tk.Frame(parent, height=10, bg=str(parent.cget("bg")) if parent.winfo_class() == "Frame" else "#09090B")
+                            sp.pack(fill="x", before=rest[0])
+                elif mgr == "grid":
+                    title.grid_remove()
+                hidden += 1
+            except Exception as _ex:
+                _trace(_ex_where(), _ex)
+        plog("UI", f"moved {hidden} in-page titles into the page header ({len(self._page_desc)} descriptions)", verbose=True)
+
+    def _motion_level_name(self):
+        if self.config.get("low_power", False):
+            return "off"
+        lv = str(self.config.get("ui_motion", "full")).lower()
+        return lv if lv in ("full", "reduced", "off") else "full"
+
+    def _apply_motion_level(self):
+        MOTION.set_level(self._motion_level_name())
+        plog("UI", f"motion -> {MOTION.stats()}")
+        if MOTION.ambient and getattr(self.tabview, "_current", None) is getattr(self, "tab_dash", None):
+            self._dash_enter()
+        self._refresh_appearance_marks()
+
+    def set_motion(self, level):
+        level = level if level in ("full", "reduced", "off") else "full"
+        self.config["ui_motion"] = level
+        self.save_settings()
+        self._apply_motion_level()
+        note = "  Low power mode is on, so it stays off until you turn that off." if self.config.get("low_power", False) and level != "off" else ""
+        self.toast(f"Motion set to {level}.{note}", "ok")
+
+    def _mo_focus_rest(self, w):
+        gen = _STUDIO.get("gen", 0)
+        if getattr(w, "_mo_gen", None) != gen or not hasattr(w, "_mo_hc"):
+            w._mo_hc = str(w.cget("highlightcolor"))
+            w._mo_hb = str(w.cget("highlightbackground"))
+            w._mo_gen = gen
+        return w._mo_hc, w._mo_hb
+
+    def _mo_focus_in(self, e):
+        w = e.widget
+        try:
+            if not MOTION.on or int(w.cget("highlightthickness")) <= 0:
+                return
+            key = ("focus", str(w))
+            if not MOTION.busy(key):
+                hc, hb = self._mo_focus_rest(w)
+            else:
+                hc, hb = w._mo_hc, w._mo_hb
+            if _hx(hc) == _hx(hb):
+                return
+            MOTION.color(key, 280, lambda c, w=w: w.configure(highlightcolor=c), hc, frm=hb)
+        except Exception:
+            pass
+
+    def _mo_focus_out(self, e):
+        w = e.widget
+        try:
+            if not MOTION.on or int(w.cget("highlightthickness")) <= 0 or not hasattr(w, "_mo_hc"):
+                return
+            hc, hb = w._mo_hc, w._mo_hb
+            if _hx(hc) == _hx(hb):
+                return
+            def done(w=w, hc=hc):
+                w.configure(highlightcolor=hc)
+            MOTION.color(("focus", str(w)), 320, lambda c, w=w: w.configure(highlightbackground=c), hb, frm=hc, done=done)
+        except Exception:
+            pass
+
+    def _motion_start(self):
+        MOTION.attach(self.root, self._motion_level_name())
+        for cls in ("Entry", "Text", "Spinbox"):
+            try:
+                self.root.bind_class(cls, "<FocusIn>", self._mo_focus_in, add="+")
+                self.root.bind_class(cls, "<FocusOut>", self._mo_focus_out, add="+")
+            except Exception as _ex:
+                _trace(_ex_where(), _ex)
+        plog("UI", f"motion engine attached - {MOTION.stats()}")
+        def first_frame():
+            if MOTION.ambient:
+                try:
+                    self.root.attributes("-alpha", 0.0)
+                    MOTION.tween("startup", 520, lambda v: self.root.attributes("-alpha", max(0.0, min(1.0, v))), 1.0, a=0.0,
+                                 ease=_ease_out_cubic, done=lambda: self.root.attributes("-alpha", 1.0))
+                except Exception as _ex:
+                    _trace(_ex_where(), _ex)
+                try:
+                    self.tabview.shine()
+                except Exception as _ex:
+                    _trace(_ex_where(), _ex)
+            if getattr(self.tabview, "_current", None) is getattr(self, "tab_dash", None):
+                self._dash_enter()
+        def safety():
+            try: self.root.attributes("-alpha", 1.0)
+            except Exception: pass
+        try:
+            self.root.after(60, first_frame)
+            self.root.after(3000, safety)
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
+
+    def _dip(self, fn):
+        try:
+            viewable = bool(self.root.winfo_viewable())
+        except Exception:
+            viewable = False
+        if not MOTION.ambient or not viewable:
+            fn()
+            return
+        self._dip_fn = fn
+        if getattr(self, "_dip_active", False):
+            return
+        self._dip_active = True
+        try:
+            had = self.root.focus_get()
+        except Exception:
+            had = None
+        try:
+            ov = tk.Toplevel(self.root)
+            ov._studio_skip_tree = True
+            ov.withdraw()
+            ov.overrideredirect(True)
+            ov.configure(bg=self._tok["bg"])
+            ov.geometry(f"{self.root.winfo_width()}x{self.root.winfo_height()}+{self.root.winfo_rootx()}+{self.root.winfo_rooty()}")
+            try: ov.attributes("-alpha", 0.0)
+            except Exception: pass
+            try: ov.attributes("-disabled", True)
+            except Exception: pass
+            ov.deiconify()
+            ov.lift()
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
+            self._dip_active = False
+            fn()
+            return
+        state = {"done": False, "ran": False}
+        def kill():
+            if state["done"]:
+                return
+            state["done"] = True
+            self._dip_active = False
+            if not state["ran"]:
+                state["ran"] = True
+                try: self._dip_fn()
+                except Exception as _ex2:
+                    log_crash("theme change", _ex2)
+            try: ov.destroy()
+            except Exception: pass
+            try:
+                if had is not None:
+                    had.focus_set()
+            except Exception:
+                pass
+        def alpha(v):
+            ov.attributes("-alpha", max(0.0, min(1.0, v)))
+        def run():
+            state["ran"] = True
+            try:
+                self._dip_fn()
+            except Exception as _ex:
+                log_crash("theme change", _ex)
+            try:
+                ov.configure(bg=self._tok["bg"])
+            except Exception:
+                pass
+            MOTION.tween("dip", 300, alpha, 0.0, a=1.0, ease=_ease_in_out, done=kill)
+        def mid():
+            try:
+                ov.update_idletasks()
+                self.root.after(1, run)
+            except Exception:
+                run()
+        MOTION.tween("dip", 150, alpha, 1.0, a=0.0, ease=_ease_in_out, done=mid)
+        self.root.after(4000, kill)
+
     def _studio_finish(self):
         self._studio_ready = True
         self._studio_restyle(force=True)
@@ -5494,6 +8397,11 @@ class ChatPlaysApp:
         try: self.tabview.apply_tokens()
         except Exception as _ex:
             _trace(_ex_where(), _ex)
+        try: self.tabview.select(self.tabview._current)
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
+        self._run_repaint_hooks()
+        self._motion_start()
         self._studio_keys()
         try: self.root.after(150, lambda: _win_titlebar(self.root, self._tok["dark"]))
         except Exception as _ex:
@@ -5511,6 +8419,7 @@ class ChatPlaysApp:
         card = tk.Frame(outer, bg=t["card"])
         card._st = {"bg": "card"}
         card.pack(fill="both", expand=True, padx=1, pady=1)
+        _mo_hover_glow(outer, ("card", str(outer)))
         if title:
             h = tk.Label(card, text=title, bg=t["card"], fg=t["hi"], font=_sf("display", 13), anchor="w")
             h._st = {"bg": "card", "fg": "hi", "font": ("display", 13)}
@@ -5733,7 +8642,7 @@ class ChatPlaysApp:
         vm_name = self.config["vm_name"]
         vbox_manage_cmd = self.config["vbox_path"]
         self.root.title(f"{self.config.get('app_name', 'YT2VM')} {version}: {vm_name}")
-        self.btn_vm.configure(text=f"target: {vm_name}")
+        self.btn_vm.configure(text=f"{vm_name}")
         console_log("SYSTEM", "vm settings saved!")
 
     def save_general_settings(self):
@@ -5769,6 +8678,9 @@ class ChatPlaysApp:
         self.listening_to_chat = self.config["enable_chat"]
         self.twenty_four_seven_mode = self.config["auto_start"]
         self.app_name = self.config["app_name"]
+        try: self.tabview.brand_name.configure(text=self.app_name)
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
         self.ultra_speed = self.config["ultra_speed"]
         self.root.title(f"{self.app_name} {version}: {vm_name}")
         console_log("SYSTEM", "general settings & timings saved!")
@@ -5787,8 +8699,14 @@ class ChatPlaysApp:
         try:
             self.console_text.configure(state='normal')
             for level, msg in batch:
-                if level in ("SYSTEM", "ERROR", "EXEC", "CHAT"): self.console_text.insert(tk.END, str(msg) + "\n", level)
-                else: self.console_text.insert(tk.END, str(msg) + "\n")
+                msg = str(msg)
+                if level == "CHAT" and "] [debug] " in msg[:40]:
+                    tag = "DEBUG"
+                elif level in ("SYSTEM", "ERROR", "EXEC", "CHAT"):
+                    tag = level
+                else:
+                    tag = "OTHER"
+                self.console_text.insert(tk.END, msg + "\n", tag)
             try:
                 line_count = int(self.console_text.index('end-1c').split('.')[0])
                 if line_count > 300: self.console_text.delete('1.0', f'{line_count - 250}.0')
@@ -5806,7 +8724,11 @@ class ChatPlaysApp:
         if self._last_status != text_lower:
             self._last_status = text_lower
             current_status = text_lower
-            if hasattr(self, 'lbl_status'): self.lbl_status.configure(text=_sentence_case(text_lower), fg=_studio_color("bad" if is_error else "ok", "#10B981"))
+            if hasattr(self, 'lbl_status'):
+                _fg = _studio_color("bad" if is_error else "ok", "#10B981")
+                self.lbl_status.configure(text=_sentence_case(text_lower), fg=_fg)
+                if MOTION.on and threading.current_thread() is threading.main_thread():
+                    MOTION.color("mstatus", 600, lambda c: self.lbl_status.configure(fg=c), _fg, frm=self._tok["card"])
             plog("STATUS", text_lower)
             try: gui_log_queue.put_nowait(("status", text_lower))
             except queue.Full: pass
@@ -5883,7 +8805,7 @@ class ChatPlaysApp:
     def _update_vm_label(self):
         try:
             self.root.title(f"{self.config.get('app_name', 'YT2VM')} {version}: {vm_name}")
-            if hasattr(self, 'btn_vm'): self.btn_vm.configure(text=f"target: {vm_name}")
+            if hasattr(self, 'btn_vm'): self.btn_vm.configure(text=f"{vm_name}")
         except Exception as _ex:
             _trace(_ex_where(), _ex)
 
@@ -5986,11 +8908,16 @@ class ChatPlaysApp:
                 plog("VOTE", f"{user} tried to start {vote_type} but 3 votes are already running")
         for m in msgs:
             self.log("[system]", m, "sysmsg")
+        for m in msgs:
+            clean = re.sub(r"\[(vote|alert|started|success)\]\s*", "", m, flags=re.I).strip()
+            if clean:
+                self._discord_announce(clean[:1].upper() + clean[1:])
         if passed is None:
             return
         clean_cmd = passed
         if clean_cmd.startswith(self.command_prefix): clean_cmd = clean_cmd[len(self.command_prefix):]
         plog("VOTE", f"vote PASSED: {clean_cmd} - executing")
+        self._discord_announce(f"Vote passed: {clean_cmd}. Running it now.")
         if clean_cmd == "skipsong" or clean_cmd == "stopsong":
             self.obs_media_action("OBS_WEBSOCKET_MEDIA_INPUT_ACTION_STOP")
             self.current_song = None
@@ -6025,9 +8952,348 @@ class ChatPlaysApp:
                 self.log("[console]", cmd, "user", is_mod=True, is_owner=True)
                 self._manual_cmd(cmd)
                 self.entry_cmd.delete(0, 'end')
+                hist = getattr(self, "_cmd_hist", None)
+                if hist is not None:
+                    if not hist or hist[-1] != cmd:
+                        hist.append(cmd)
+                    del hist[:-50]
+                    self._cmd_hist_i = len(hist)
         except Exception as e:
             self.log("[system]", f"[error] manual cmd error: {e}", "err")
             console_log("ERROR", f"[error] manual cmd error: {e}\n{traceback.format_exc()}")
+
+    def _cmd_history(self, d):
+        hist = getattr(self, "_cmd_hist", [])
+        if not hist:
+            return "break"
+        i = max(0, min(len(hist), getattr(self, "_cmd_hist_i", len(hist)) + d))
+        self._cmd_hist_i = i
+        try:
+            self.entry_cmd.delete(0, "end")
+            if i < len(hist):
+                self.entry_cmd.insert(0, hist[i])
+                self.entry_cmd.icursor("end")
+            self._cmd_hint_update()
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
+        return "break"
+
+    def _palette_run(self, cmd):
+        cmd = str(cmd).strip()
+        if not cmd:
+            return
+        if cmd.startswith("!") and not cmd.startswith(self.command_prefix):
+            cmd = self.command_prefix + cmd[1:]
+        self.log("[console]", cmd, "user", is_mod=True, is_owner=True)
+        self._manual_cmd(cmd)
+
+    def _palette_actions(self):
+        acts = [
+            ("Connect chat", "Use the stream link on the Dashboard", self.go_live),
+            ("Pause or resume chat commands", "Chat", self.toggle_pause_chat),
+            ("Enable or stop the Discord bot", "Discord", self.toggle_crossplay),
+            ("Toggle the base64 filter", "Security", self._palette_toggle_b64),
+            ("Start VM", "Machine", lambda: self._vm_action("startvm")),
+            ("Shut down VM", "Machine", lambda: self._vm_action("shutdown")),
+            ("Restart VM", "Machine", lambda: self._vm_action("restartvm")),
+            ("Revert to snapshot", "Machine", lambda: self._vm_action("revert")),
+            ("Take a quick snapshot", "Machine", self.quick_snapshot),
+            ("Pause VM", "Machine", self.pause_vm),
+            ("Resume VM", "Machine", self.resume_vm),
+            ("Cycle target VM", "Machine", self.cycle_vm),
+            ("Rebuild COM session", "Recovery", lambda: setattr(self, "force_session_refresh", True)),
+            ("Clear command queue", "Recovery", self.clear_commands),
+            ("Close VirtualBox crash dialogs", "Recovery", lambda: threading.Thread(target=self._dismiss_crash_dialogs, daemon=True).start()),
+            ("Toggle low power mode", "Performance", self._toggle_low_power),
+            ("Switch light / dark", "Appearance", self.toggle_dark_light),
+            ("Show or hide the chat pane", "Layout", lambda: self.tabview.toggle_chat_pane()),
+            ("Focus the console", "Dashboard", lambda: (self.tabview.select(self.tab_dash), self.root.after(40, self.entry_cmd.focus_set))),
+            ("Clear the console", "Dashboard", self._clear_console),
+            ("Export chat messages", "Backup", self.extract_all_msgs),
+            ("Open the output log", "Logs", lambda: self._open_file(_OUT_LOG)),
+            ("Open the crash log", "Logs", lambda: self._open_file(CRASH_LOG)),
+            ("Open the user guide", "Help", lambda: self.show_welcome_guide(force=True)),
+            ("Minimize window", "Window", self._minimize_window),
+        ]
+        for key, base in _STUDIO_BASE.items():
+            acts.append((f"Theme: {base['name']}", "Appearance", lambda k=key: self.apply_theme(k)))
+        for lv in ("full", "reduced", "off"):
+            acts.append((f"Motion: {lv}", "Appearance", lambda lv=lv: self.set_motion(lv)))
+        return acts
+
+    def _clear_console(self):
+        try:
+            self.console_text.configure(state="normal")
+            self.console_text.delete("1.0", "end")
+            self.console_text.configure(state="disabled")
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
+
+    def _set_console_filter(self, key):
+        self._console_filter = key
+        show = {"all": None, "chat": {"CHAT"}, "system": {"SYSTEM", "EXEC", "OTHER", "DEBUG"}, "errors": {"ERROR"}}.get(key)
+        try:
+            for tg in ("SYSTEM", "ERROR", "EXEC", "CHAT", "OTHER", "DEBUG"):
+                self.console_text.tag_config(tg, elide=bool(show is not None and tg not in show))
+            self.console_text.see("end")
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
+        self._paint_console_chips(animate=True)
+
+    def _paint_console_chips(self, animate=False):
+        t = self._tok
+        for key, ch in getattr(self, "_console_chips", {}).items():
+            on = key == getattr(self, "_console_filter", "all")
+            bg = t["accent_tint"] if on else t["card"]
+            fg = t["accent_text"] if on else t["muted"]
+            try:
+                ch.configure(font=_sf("ui", 9, "semi"))
+                if animate and MOTION.on:
+                    MOTION.color(("chip", key), 220, lambda c, ch=ch: ch.configure(bg=c), bg)
+                    MOTION.color(("chipfg", key), 220, lambda c, ch=ch: ch.configure(fg=c), fg)
+                else:
+                    MOTION.cancel(("chip", key)); MOTION.cancel(("chipfg", key))
+                    MOTION.col[("chip", key)] = bg
+                    MOTION.col[("chipfg", key)] = fg
+                    ch.configure(bg=bg, fg=fg)
+            except Exception as _ex:
+                _trace(_ex_where(), _ex)
+
+    def _chat_pane_msg(self, user, message, is_mod=False, is_owner=False):
+        nav = getattr(self, "tabview", None)
+        if nav is None or not hasattr(nav, "push_chat"):
+            return
+        m = str(message)
+        tag = "cmd" if m.strip().startswith(self.command_prefix) else "usr"
+        badge = "OWNER" if is_owner else ("MOD" if is_mod else None)
+        self.ui(nav.push_chat, user, m, tag, badge)
+
+    def _count(self, key, lbl, n, fmt="{:,}", flash=False):
+        cnt = self.__dict__.setdefault("_cnt", {})
+        cur = cnt.get(key)
+        cnt[key] = n
+        mk = ("count", key)
+        if cur is None or not MOTION.on:
+            MOTION.cancel(mk)
+            MOTION.val[mk] = float(n)
+            txt = fmt.format(n)
+            if lbl.cget("text") != txt:
+                lbl.configure(text=txt)
+            return
+        if cur == n:
+            return
+        start = MOTION.val.get(mk, float(cur))
+        MOTION.tween(mk, 700, lambda v, l=lbl: l.configure(text=fmt.format(int(round(v)))), float(n), a=start,
+                     ease=_ease_out_cubic)
+        if flash:
+            t = self._tok
+            MOTION.color(("countfx", key), 1100, lambda c, l=lbl: l.configure(fg=c), t["hi"],
+                         frm=t["ok"] if n > cur else t["bad"])
+
+    def _dash_enter(self):
+        if not hasattr(self, "_metric"):
+            return
+        if MOTION.on:
+            def rev(v):
+                self._spark_rev = max(0.0, min(1.0, v))
+                self._draw_sparks()
+            MOTION.tween("sparkrev", 1000, rev, 1.0, a=0.0, ease=_ease_in_out, delay=120)
+            cnt = self.__dict__.setdefault("_cnt", {})
+            for i, key in enumerate(("viewers", "queue", "cpm")):
+                n = cnt.get(key)
+                if n:
+                    lbl = self._metric[key]["val"]
+                    lbl.configure(text="0")
+                    MOTION.tween(("count", key), 800, lambda v, l=lbl: l.configure(text="{:,}".format(int(round(v)))),
+                                 float(n), a=0.0, ease=_ease_out_cubic, delay=80 + i * 70)
+            self._ok_shown = 0.0
+            MOTION.tween("okbar", 900, self._okbar_step, self._ok_target(), a=0.0, ease=_ease_out_cubic, delay=300)
+        MOTION.loop("sparkpulse", self._spark_pulse, 1600, fps=30)
+        MOTION.loop("health", self._health_frame, 2400, fps=24)
+
+    def _ok_target(self):
+        tot = max(1, total_commands_executed)
+        return max(0.0, 1.0 - total_commands_failed / float(tot))
+
+    def _okbar_step(self, v):
+        self._ok_shown = v
+        self._draw_okbar()
+
+    def _draw_okbar(self):
+        t = self._tok
+        cv = self._metric["uptime"]["cv"]
+        cv.delete("all")
+        cv.configure(bg=t["card"])
+        w, h = cv.winfo_width(), cv.winfo_height()
+        if w <= 40:
+            return
+        ok = max(0.0, min(1.0, getattr(self, "_ok_shown", self._ok_target())))
+        tgt = self._ok_target()
+        y = h / 2.0 + 4
+        x1, x2 = 16, w - 16
+        _rrect(cv, x1, y - 3, x2, y + 3, 3, fill=t["raised"], outline="")
+        if ok > 0:
+            col = t["ok"] if tgt > 0.9 else (t["warn"] if tgt > 0.6 else t["bad"])
+            _rrect(cv, x1, y - 3, x1 + max(6, (x2 - x1) * ok), y + 3, 3, fill=col, outline="")
+            cv.create_oval(x1 + max(6, (x2 - x1) * ok) - 3, y - 3, x1 + max(6, (x2 - x1) * ok) + 3, y + 3,
+                           fill=mix(col, "#FFFFFF", 0.35), outline="")
+
+    def _spark_pulse(self, ph):
+        t = self._tok
+        if getattr(self.tabview, "_current", None) is not getattr(self, "tab_dash", None):
+            return
+        for key, tip in list(getattr(self, "_spark_tips", {}).items()):
+            cv = self._metric[key]["cv"]
+            try:
+                cv.delete("pulse")
+                if tip is None or MOTION.busy("sparkrev"):
+                    continue
+                x, y, col = tip
+                r = 3 + 9 * ph
+                cv.create_oval(x - r, y - r, x + r, y + r, outline=mix(col, t["card"], ph), width=1.6, tags="pulse")
+            except Exception:
+                pass
+
+    def _health_frame(self, ph):
+        t = self._tok
+        on_dash = getattr(self.tabview, "_current", None) is getattr(self, "tab_dash", None)
+        for i, (nm, dt) in enumerate(getattr(self, "_tile_dots", {}).items()):
+            on = getattr(self, "_tile_state", {}).get(nm, False)
+            if MOTION.busy(("tiledot", nm)):
+                continue
+            try:
+                if on and on_dash and MOTION.ambient:
+                    dt.configure(fg=mix(t["ok"], t["ok_tint"], 0.7 * _breath((ph + i * 0.17) % 1.0)))
+                else:
+                    dt.configure(fg=t["ok"] if on else t["faint"])
+            except Exception:
+                pass
+
+    def _draw_sparks(self):
+        t = self._tok
+        hist = getattr(self, "_dash_hist", None)
+        if not hist or not hasattr(self, "_metric"):
+            return
+        rev = max(0.0, min(1.0, getattr(self, "_spark_rev", 1.0)))
+        self._spark_tips = {}
+        for key, col in (("viewers", t["info"]), ("queue", t["warn"] if (hist["queue"] and hist["queue"][-1] > 25) else t["accent"]),
+                         ("cpm", t["ok"])):
+            cv = self._metric[key]["cv"]
+            try:
+                cv.delete("all")
+                cv.configure(bg=t["card"])
+                w, h = cv.winfo_width(), cv.winfo_height()
+                if w < 20 or h < 10:
+                    continue
+                data = list(hist[key])
+                n = len(data)
+                base = h - 2
+                cv.create_line(0, base, w, base, fill=t["line"])
+                if n < 2:
+                    self._spark_tips[key] = None
+                    continue
+                hi = max(max(data), 1.0)
+                lo = 0.0
+                pts = []
+                for i, v in enumerate(data):
+                    x = 1 + (i / float(n - 1)) * (w - 16)
+                    y = base - (float(v) - lo) / (hi - lo) * (h - 13)
+                    pts += [x, y]
+                if rev < 1.0:
+                    xmax = 1 + rev * (w - 16)
+                    keep = [i for i in range(0, len(pts), 2) if pts[i] <= xmax]
+                    if len(keep) < 2:
+                        self._spark_tips[key] = None
+                        continue
+                    pts = [c for i in keep for c in (pts[i], pts[i + 1])]
+                poly = [pts[0], base] + pts + [pts[-2], base]
+                cv.create_polygon(*poly, fill=mix(t["card"], col, 0.16), outline="")
+                cv.create_line(*pts, fill=col, width=1.6, smooth=True)
+                cv.create_oval(pts[-2] - 2.5, pts[-1] - 2.5, pts[-2] + 2.5, pts[-1] + 2.5, fill=col, outline="")
+                self._spark_tips[key] = (pts[-2], pts[-1], col)
+            except Exception as _ex:
+                _trace(_ex_where(), _ex)
+        try:
+            tgt = self._ok_target()
+            if not MOTION.busy("okbar"):
+                cur = getattr(self, "_ok_shown", None)
+                if cur is None or not MOTION.on:
+                    self._ok_shown = tgt
+                elif abs(cur - tgt) > 0.001:
+                    MOTION.tween("okbar", 600, self._okbar_step, tgt, a=cur)
+                    return
+            self._draw_okbar()
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
+
+    def _dash_tick(self, h, m, s):
+        hist = getattr(self, "_dash_hist", None)
+        if hist is None:
+            return
+        now = time.time()
+        qn = self.cmd_queue.qsize()
+        try: waiting = self.cmd_queue.waiting_viewers()
+        except Exception: waiting = 0
+        try: viewers = float(str(current_viewers).replace(",", "") or 0)
+        except Exception: viewers = 0.0
+        self._dash_cmdlog.append((now, total_commands_executed))
+        old = None
+        for ts, n in self._dash_cmdlog:
+            if now - ts <= 60:
+                old = (ts, n)
+                break
+        cpm = 0
+        if old is not None and now - old[0] > 0.5:
+            cpm = int(round((total_commands_executed - old[1]) * 60.0 / max(1.0, min(60.0, now - old[0])))) if now - old[0] >= 10 else total_commands_executed - old[1]
+        last = getattr(self, "_dash_last_sample", 0)
+        if now - last >= 2.0:
+            self._dash_last_sample = now
+            hist["viewers"].append(viewers)
+            hist["queue"].append(qn)
+            hist["cpm"].append(cpm)
+        mt = self._metric
+        def setl(lbl, txt, fg=None):
+            try:
+                if lbl.cget("text") != txt:
+                    lbl.configure(text=txt)
+                if fg is not None:
+                    lbl.configure(fg=fg)
+            except Exception as _ex:
+                _trace(_ex_where(), _ex)
+        t = self._tok
+        self._count("viewers", mt["viewers"]["val"], int(viewers), flash=True)
+        setl(mt["viewers"]["sub"], f"{current_likes} likes")
+        self._count("queue", mt["queue"]["val"], int(qn))
+        if not MOTION.busy(("countfx", "queue")):
+            setl(mt["queue"]["val"], mt["queue"]["val"].cget("text"), t["warn"] if qn > 25 else t["hi"])
+        setl(mt["queue"]["sub"], f"{waiting} viewer{'s' if waiting != 1 else ''} waiting" if waiting else "Nobody waiting")
+        self._count("cpm", mt["cpm"]["val"], int(cpm))
+        setl(mt["cpm"]["sub"], f"{total_commands_executed:,} run  /  {total_commands_failed:,} failed")
+        d, hh = divmod(h, 24)
+        setl(mt["uptime"]["val"], (f"{d}d {hh}h {m:02d}m" if d else f"{h}h {m:02d}m"))
+        tot = max(1, total_commands_executed)
+        setl(mt["uptime"]["sub"], f"Success rate {100.0 * (1 - total_commands_failed / float(tot)):.1f}%")
+        vh = list(hist["viewers"])
+        if len(vh) >= 2:
+            dv = vh[-1] - vh[max(0, len(vh) - 30)]
+            setl(mt["viewers"]["trend"], ("+" if dv > 0 else "") + f"{int(dv)} in 1m" if dv else "steady")
+        setl(mt["queue"]["trend"], "busy" if qn > 25 else "")
+        setl(mt["cpm"]["trend"], "")
+        setl(mt["uptime"]["trend"], "")
+        alive = bool(getattr(self, "listening_to_chat", False)) and bool(getattr(self, "active_url", ""))
+        try:
+            _st_txt = (f"Listening to {self.active_url}" if alive else ("Chat listener off" if getattr(self, "active_url", "") else "Not connected"))
+            _st_fg = t["ok_soft"] if alive else t["faint"]
+            if self._stream_state.cget("text") != _st_txt and MOTION.on:
+                self._stream_state.configure(text=_st_txt)
+                MOTION.color("streamstate", 500, lambda c: self._stream_state.configure(fg=c), _st_fg, frm=t["card"])
+            elif not MOTION.busy("streamstate"):
+                setl(self._stream_state, _st_txt, _st_fg)
+            self._stream_dot.configure(fg=t["ok"] if alive else t["faint"])
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
+        if getattr(self.tabview, "_current", None) is self.tab_dash:
+            self._draw_sparks()
 
     def log(self, user, message, tag="sysmsg", is_mod=False, is_owner=False):
         if not isinstance(message, str): message = str(message)
@@ -6056,14 +9322,13 @@ class ChatPlaysApp:
         try:
             nav = getattr(self, "tabview", None)
             if nav is not None and hasattr(nav, "push_chat"):
-                low = str(message).lower()
-                t = "sys"
-                if user == "[system]":
-                    t = "err" if ("[err" in low or "[error" in low or "[warn" in low) else "sys"
-                elif is_owner or is_mod: t = "mod"
-                elif str(message).strip().startswith(self.command_prefix): t = "cmd"
-                else: t = "usr"
-                self.ui(nav.push_chat, user, message, t)
+                if user == "[console]":
+                    t = "cmd" if str(message).strip().startswith(self.command_prefix) else "usr"
+                    self.ui(nav.push_chat, "Console", message, t, "OWNER")
+                elif user == "[announcement]":
+                    self.ui(nav.push_chat, "Announcement", message, "sys", "INFO")
+                elif not user.startswith("["):
+                    self._chat_pane_msg(user, message, is_mod, is_owner)
         except Exception as _ex:
             _trace(_ex_where(), _ex)
 
@@ -6160,8 +9425,18 @@ class ChatPlaysApp:
                 nav.set_status(left=f"{'VMware' if be == 'vmware' else 'VirtualBox'}  /  {vm_name}",
                                right=f"Up {h}h {m:02d}m", running=running)
                 alive = bool(getattr(self, "listening_to_chat", False)) and bool(getattr(self, "active_url", ""))
-                if hasattr(nav, "chat_dot"):
-                    nav.chat_dot.configure(text="connected" if alive else "offline", fg=_studio_color("ok" if alive else "faint", "#71717A"))
+                if hasattr(nav, "set_chat_state"):
+                    nav.set_chat_state(alive)
+                if hasattr(nav, "set_activity"):
+                    try: _wv = self.cmd_queue.waiting_viewers()
+                    except Exception: _wv = 0
+                    nav.set_activity(getattr(self, "_exec_current", ""), qn, _wv)
+                if hasattr(nav, "pulse"):
+                    nav.pulse()
+                if hasattr(nav, "set_badge"):
+                    _mq = len(getattr(self, "music_queue", []) or [])
+                    nav.set_badge("Music Queue", str(_mq) if _mq else "")
+                    nav.set_badge("Automation", str(len(self.automations)) if getattr(self, "automations", None) else "")
                 if hasattr(nav, "set_tally"):
                     nav.set_tally("chat", "On air" if alive else "Off air", "onair" if alive else "off")
                     nav.set_tally("vm", "VM running" if running else "VM stopped", "ok" if running else "off")
@@ -6180,22 +9455,41 @@ class ChatPlaysApp:
                 vmrun = getattr(self, "_lastvmstate", False)
                 chat_on = bool(getattr(self, "listening_to_chat", False)) and bool(getattr(self, "active_url", ""))
                 pico_on = bool(getattr(self, "pico_enabled", False))
-                for nm, on in (("Bot Status", chat_on), ("VM", vmrun),
-                               ("Overlay Server", bool(getattr(self, "_flask_started", False))),
-                               ("Real PC", pico_on)):
+                obs_on = bool(getattr(self, "_obs_ok", False))
+                _dc = getattr(self, "discord", None)
+                dc_on = bool(_dc and _dc.online)
+                for nm, on, txt_on, txt_off in (("Bot Status", chat_on, "Listening", "Stopped"), ("VM", vmrun, "Running", "Stopped"),
+                                                ("Discord", dc_on, "Online", ("Connecting" if (_dc and _dc.running) else "Off")),
+                                                ("OBS", obs_on, "Linked", "Offline"),
+                                                ("Overlay Server", bool(getattr(self, "_flask_started", False)), f"Port {flask_port}", "Stopped"),
+                                                ("Real PC", pico_on, "Connected", "Not connected")):
                     lb = self._tiles.get(nm)
+                    tstate = self.__dict__.setdefault("_tile_state", {})
+                    was = tstate.get(nm)
+                    tstate[nm] = on
+                    _tt = self._tok
                     if lb is not None:
-                        lb.configure(text="Running" if on else "Stopped", fg=_studio_color("ok" if on else "muted", "#10B981"))
+                        want = txt_on if on else txt_off
+                        if lb.cget("text") != want:
+                            lb.configure(text=want)
+                        if was is not None and was != on and MOTION.on:
+                            MOTION.color(("tiletxt", nm), 700, lambda c, l=lb: l.configure(fg=c),
+                                         _tt["hi"] if on else _tt["muted"], frm=_tt["card"])
+                        elif not MOTION.busy(("tiletxt", nm)):
+                            lb.configure(fg=_studio_color("hi" if on else "muted", "#10B981"))
+                    dt = getattr(self, "_tile_dots", {}).get(nm)
+                    if dt is not None:
+                        if was is not None and was != on and MOTION.on:
+                            MOTION.color(("tiledot", nm), 900, lambda c, d=dt: d.configure(fg=c),
+                                         _tt["ok"] if on else _tt["faint"], frm=_tt["hi"] if on else _tt["bad"])
+                        elif not MOTION.looping("health") or not MOTION.ambient:
+                            dt.configure(fg=_studio_color("ok" if on else "faint", "#10B981"))
         except Exception as _ex:
             _trace(_ex_where(), _ex)
-        if hasattr(self, 'lbl_uptime_val'):
-            try:
-                self.lbl_uptime_val.config(text=f"{h}h {m}m {s}s")
-                self.lbl_cmds_val.config(text=f"{total_commands_executed} ({total_commands_failed} failed)")
-                self.lbl_viewers_val.config(text=str(current_viewers))
-                self.lbl_likes_val.config(text=str(current_likes))
-            except Exception as _ex:
-                _trace(_ex_where(), _ex)
+        try:
+            self._dash_tick(h, m, s)
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
         t = self._ui_sec("tiles", t)
 
         q_hash = str([x["title"] for x in getattr(self, 'music_queue', [])])
@@ -6209,10 +9503,30 @@ class ChatPlaysApp:
                 _trace(_ex_where(), _ex)
         if hasattr(self, "lbl_music_playing"):
             try:
-                if getattr(self, 'current_song', None):
-                    self.lbl_music_playing.config(text=f"PLAYING: {self.current_song['title']}")
-                else:
-                    self.lbl_music_playing.config(text="NO MUSIC PLAYING")
+                cs = getattr(self, 'current_song', None)
+                want = (str(cs.get('title', '?')) if cs else "Nothing playing")
+                by = (f"Requested by {cs.get('user', '?')}" if cs else "Viewers queue songs with !music <url>")
+                if self.lbl_music_playing.cget("text") != want:
+                    self.lbl_music_playing.config(text=want)
+                    if MOTION.on:
+                        _t = self._tok
+                        MOTION.color("nowplaying", 600, lambda c: self.lbl_music_playing.configure(fg=c), _t["hi"], frm=_t["card"])
+                        MOTION.tween("nowplaying_x", 520, lambda v: self.lbl_music_playing.pack_configure(padx=(int(18 * (1 - v)), 0)),
+                                     1.0, a=0.0, ease=_ease_out_back)
+                if cs and hasattr(self, "_music_eq"):
+                    MOTION.loop("musiceq", self._music_eq, 2400, fps=24)
+                elif MOTION.looping("musiceq"):
+                    MOTION.unloop("musiceq", rest=False)
+                    try: self._paint_music_art()
+                    except Exception as _ex:
+                        _trace(_ex_where(), _ex)
+                if hasattr(self, "lbl_music_by") and self.lbl_music_by.cget("text") != by:
+                    self.lbl_music_by.config(text=by)
+                if hasattr(self, "_music_empty"):
+                    if getattr(self, "music_queue", None):
+                        self._music_empty.place_forget()
+                    elif not self._music_empty.winfo_manager():
+                        self._music_empty.place(relx=0.5, rely=0.4, anchor="center")
             except Exception as _ex:
                 _trace(_ex_where(), _ex)
         t = self._ui_sec("music", t)
@@ -6377,6 +9691,22 @@ class ChatPlaysApp:
             except Exception: found = False
             req = any(m == mod for m, _, _ in _rqp)
             add(True if found else (False if req else None), f"{pip:<16}", why if found else f"missing - pip install {pip}")
+        import importlib.util as _ilu
+        _dc = False
+        try: _dc = _ilu.find_spec("discord") is not None
+        except Exception: _dc = False
+        add(_dc if _dc else None, f"{'discord.py':<16}", "Discord crossplay bot" if _dc else "installs automatically when you enable the bot")
+        L.append("")
+        L.append("--- discord ---")
+        _br = getattr(self, "discord", None)
+        add(bool(_br and _br.online) if (_br and _br.running) else None, "bot",
+            (_br.state + (f" ({_br.user_tag})" if _br.user_tag else "")) if _br else "stopped")
+        add(None if not self.config.get("discord_enabled") else True, "enabled",
+            "yes, mode=" + str(self.config.get("discord_mode", "crossplay")) if self.config.get("discord_enabled") else "no")
+        add(bool(self._did("discord_channel_id")), "command channel",
+            (self.discord.channel_name(self._did("discord_channel_id")) or str(self._did("discord_channel_id"))) if self._did("discord_channel_id") else "not picked")
+        add(bool(discord_token_load()), "saved token", "present" if discord_token_load() else "none - paste it on the Discord page")
+        add(self._b64_filter_on(), "base64 filter", ("on" + (f", {len(self.b64_offenders)} blocked" if self.b64_offenders else "")) if self._b64_filter_on() else "OFF")
         L.append("")
         L.append("--- virtualbox ---")
         path, how = resolve_vbox_path(self.config.get("vbox_path", ""))
@@ -6427,22 +9757,440 @@ class ChatPlaysApp:
         L.append(self._trace_report())
         return "\n".join(L)
 
+    def _discord_logo(self, cv, size):
+        t = self._tok
+        cv.delete("all")
+        bg = t["bg"]
+        cv.configure(bg=bg)
+        c = int(size)
+        br = getattr(self, "discord", None)
+        online = bool(br and br.online)
+        img = _user_logo(int(c * 0.78))
+        tint = t["ok_tint"] if online else t["accent_tint"]
+        edge = t["ok_edge"] if online else t["accent_edge"]
+        _rrect(cv, 1, 1, c - 1, c - 1, c * 0.24, fill=tint, outline=edge)
+        if img is not None:
+            cv.create_image(c / 2.0, c / 2.0, image=img)
+        else:
+            _draw_icon(cv, "bridge", c / 2.0, c / 2.0, c * 0.6, t["ok"] if online else t["accent_text"], tint, w=2.0 * c / 54.0)
+
+    def build_discord_tab(self):
+        t = self._tok
+        S = getattr(self, "_ui_scale", 1.0)
+        wrap = self.make_scrollable(self.tab_discord)
+        pad = 26
+
+        def card(parent, pack=True):
+            o = tk.Frame(parent, bg=t["line"]); o._st = {"bg": "line"}
+            c = tk.Frame(o, bg=t["card"]); c._st = {"bg": "card"}
+            c.pack(fill="both", expand=True, padx=1, pady=1)
+            if pack:
+                o.pack(fill="x", padx=pad, pady=(0, 14))
+            return o, c
+
+        head = tk.Frame(wrap, bg=t["bg"]); head._st = {"bg": "bg"}
+        head.pack(fill="x", padx=pad, pady=(20, 14))
+        logo = tk.Canvas(head, width=int(54 * S), height=int(54 * S), bd=0, highlightthickness=0, bg=t["bg"])
+        logo._studio_skip = True
+        logo.pack(side="left")
+        self._discord_logo_cv = logo
+        htx = tk.Frame(head, bg=t["bg"]); htx._st = {"bg": "bg"}
+        htx.pack(side="left", padx=(14, 0), fill="x", expand=True)
+        self._st_label(htx, "Discord bridge", bg="bg", fg="hi", font=("display", 17), anchor="w").pack(anchor="w")
+        self._discord_state_lbl = self._st_label(htx, "Stopped", bg="bg", fg="muted", font=("ui", 10), anchor="w")
+        self._discord_state_lbl.pack(anchor="w", pady=(2, 0))
+
+        _o, setup = card(wrap)
+        inner = tk.Frame(setup, bg=t["card"]); inner._st = {"bg": "card"}
+        inner.pack(fill="x", padx=16, pady=16)
+        self._st_label(inner, "Bot token", bg="card", fg="hi", font=("ui", 10, "semi"), anchor="w").pack(anchor="w")
+        self._st_label(inner, "From the Discord Developer Portal > your app > Bot > Reset Token. It is saved (encrypted on Windows) so it survives a crash or restart.",
+                       bg="card", fg="faint", font=("ui", 9), anchor="w", justify="left", wraplength=int(620 * S)).pack(anchor="w", pady=(1, 8))
+        trow = tk.Frame(inner, bg=t["card"]); trow._st = {"bg": "card"}
+        trow.pack(fill="x")
+        self.discord_token_entry = tk.Entry(trow, font=_sf("mono", 11), bg=t["input"], fg=t["hi"], insertbackground=t["hi"],
+                                            bd=0, show="\u2022", highlightthickness=1, highlightbackground=t["line"], highlightcolor=t["accent"])
+        self.discord_token_entry.pack(side="left", fill="x", expand=True, ipady=7)
+        if discord_token_load():
+            self.discord_token_entry.insert(0, self._discord_token_mask())
+            self._discord_token_cache = discord_token_load()
+        self._discord_show_var = tk.BooleanVar(value=False)
+        def _toggle_show():
+            self.discord_token_entry.configure(show="" if self._discord_show_var.get() else "\u2022")
+        ttk.Checkbutton(trow, text="Show", variable=self._discord_show_var, command=_toggle_show).pack(side="left", padx=(10, 0))
+        self._st_button(trow, "Save token", self.save_discord_token, "neutral", 9).pack(side="left", padx=(10, 0))
+        self._discord_hint = self._st_label(inner, "", bg="card", fg="muted", font=("ui", 9), anchor="w", justify="left", wraplength=int(620 * S))
+        self._discord_hint.pack(anchor="w", pady=(8, 0))
+
+        _o2, modec = card(wrap)
+        mi = tk.Frame(modec, bg=t["card"]); mi._st = {"bg": "card"}
+        mi.pack(fill="x", padx=16, pady=16)
+        self._st_label(mi, "Mode", bg="card", fg="hi", font=("ui", 10, "semi"), anchor="w").pack(anchor="w", pady=(0, 6))
+        self._discord_mode_var = tk.StringVar(value=self.config.get("discord_mode", "crossplay"))
+        for val, title, sub in (
+                ("crossplay", "Discord + YouTube crossplay", "Both chats drive the VM at once. Votes and commands are shared."),
+                ("discord", "Discord only", "Only Discord can run commands. YouTube chat still shows, but its commands are ignored.")):
+            row = tk.Frame(mi, bg=t["card"]); row._st = {"bg": "card"}
+            row.pack(fill="x", pady=2)
+            rb = ttk.Radiobutton(row, text="", value=val, variable=self._discord_mode_var,
+                                 command=self._on_discord_mode)
+            rb.pack(side="left")
+            txt = tk.Frame(row, bg=t["card"], cursor="hand2"); txt._st = {"bg": "card"}
+            txt.pack(side="left", fill="x", expand=True)
+            self._st_label(txt, title, bg="card", fg="text", font=("ui", 10, "semi"), anchor="w").pack(anchor="w")
+            self._st_label(txt, sub, bg="card", fg="faint", font=("ui", 9), anchor="w").pack(anchor="w")
+            for w in (txt,) + tuple(txt.winfo_children()):
+                w.bind("<Button-1>", lambda e, v=val: (self._discord_mode_var.set(v), self._on_discord_mode()))
+
+        self.btn_crossplay = self._st_button(mi, "Enable Discord & YouTube crossplay", self.toggle_crossplay, "primary", 11)
+        self.btn_crossplay.pack(fill="x", pady=(12, 0), ipady=4)
+
+        _o3, chans = card(wrap)
+        ci = tk.Frame(chans, bg=t["card"]); ci._st = {"bg": "card"}
+        ci.pack(fill="x", padx=16, pady=16)
+        hc = tk.Frame(ci, bg=t["card"]); hc._st = {"bg": "card"}
+        hc.pack(fill="x")
+        self._st_label(hc, "Server & channels", bg="card", fg="hi", font=("ui", 10, "semi"), anchor="w").pack(side="left")
+        self._st_button(hc, "Refresh", self._discord_rescan, "neutral", 9).pack(side="right")
+        self._st_label(ci, "Pick these after the bot is online. The command channel is where viewers type; the log channel is optional.",
+                       bg="card", fg="faint", font=("ui", 9), anchor="w", justify="left", wraplength=int(620 * S)).pack(anchor="w", pady=(1, 10))
+
+        grid = tk.Frame(ci, bg=t["card"]); grid._st = {"bg": "card"}
+        grid.pack(fill="x")
+        grid.columnconfigure(1, weight=1)
+        self._discord_combos = {}
+        rowdefs = [("Server", "guild"), ("Command channel", "channel"), ("Log channel (optional)", "log")]
+        for i, (lbl, key) in enumerate(rowdefs):
+            self._st_label(grid, lbl, bg="card", fg="muted", font=("ui", 9), anchor="e", width=20).grid(row=i, column=0, sticky="e", padx=(0, 12), pady=5)
+            cb = ttk.Combobox(grid, state="readonly", font=("Segoe UI", 10))
+            cb.grid(row=i, column=1, sticky="we", pady=5, ipady=3)
+            cb.bind("<<ComboboxSelected>>", lambda e, k=key: self._on_discord_pick(k))
+            self._discord_combos[key] = cb
+
+        orow = tk.Frame(ci, bg=t["card"]); orow._st = {"bg": "card"}
+        orow.pack(fill="x", pady=(10, 0))
+        self._st_label(orow, "Extra owner IDs", bg="card", fg="muted", font=("ui", 9), anchor="e", width=20).pack(side="left", padx=(0, 12))
+        self.discord_owner_entry = tk.Entry(orow, font=_sf("mono", 10), bg=t["input"], fg=t["hi"], insertbackground=t["hi"],
+                                            bd=0, highlightthickness=1, highlightbackground=t["line"], highlightcolor=t["accent"])
+        self.discord_owner_entry.pack(side="left", fill="x", expand=True, ipady=5)
+        self.discord_owner_entry.insert(0, str(self.config.get("discord_owner_ids", "")))
+        self.discord_owner_entry.bind("<FocusOut>", lambda e: self._save_discord_owners())
+        self.discord_owner_entry.bind("<Return>", lambda e: self._save_discord_owners())
+        self._st_label(ci, "Server admins already count as mods. Add user IDs here (comma-separated) to grant owner rights to specific people.",
+                       bg="card", fg="faint", font=("ui", 8), anchor="w", justify="left", wraplength=int(620 * S)).pack(anchor="w", pady=(4, 0))
+
+        togrow = tk.Frame(ci, bg=t["card"]); togrow._st = {"bg": "card"}
+        togrow.pack(fill="x", pady=(12, 0))
+        self._discord_screens_var = tk.BooleanVar(value=bool(self.config.get("discord_screens", True)))
+        self._discord_logall_var = tk.BooleanVar(value=bool(self.config.get("discord_log_all", True)))
+        ttk.Checkbutton(togrow, text="Post a VM screenshot with each 'Pressed:' batch", variable=self._discord_screens_var,
+                        command=lambda: self._save_discord_toggle("discord_screens", self._discord_screens_var)).pack(anchor="w", pady=2)
+        ttk.Checkbutton(togrow, text="Log every command and message to the log channel", variable=self._discord_logall_var,
+                        command=lambda: self._save_discord_toggle("discord_log_all", self._discord_logall_var)).pack(anchor="w", pady=2)
+
+        _o4, secc = card(wrap)
+        si = tk.Frame(secc, bg=t["card"]); si._st = {"bg": "card"}
+        si.pack(fill="x", padx=16, pady=16)
+        srow = tk.Frame(si, bg=t["card"]); srow._st = {"bg": "card"}
+        srow.pack(fill="x")
+        self._st_label(srow, "Base64 filter", bg="card", fg="hi", font=("ui", 10, "semi"), anchor="w").pack(side="left")
+        self._b64_pill = tk.Label(srow, text="ON", padx=10, pady=2)
+        self._b64_pill._studio_skip = True
+        self._b64_pill.pack(side="right")
+        self._st_label(si, "Blocks PowerShell / cmd / Python base64 payloads on both YouTube and Discord, and stops that sender from issuing any more commands. "
+                           "Chat toggles: !tob64 turns it off, !eb64 turns it back on. !unblock <user> clears one sender.",
+                       bg="card", fg="faint", font=("ui", 9), anchor="w", justify="left", wraplength=int(620 * S)).pack(anchor="w", pady=(2, 10))
+        self._b64_var = tk.BooleanVar(value=self._b64_filter_on())
+        ttk.Checkbutton(si, text="Block base64 command payloads", variable=self._b64_var,
+                        command=self._toggle_b64_ui).pack(anchor="w")
+        self._b64_block_lbl = self._st_label(si, "", bg="card", fg="muted", font=("ui", 9), anchor="w")
+        self._b64_block_lbl.pack(anchor="w", pady=(8, 0))
+        self._st_button(si, "Clear the base64 block list", self._clear_offenders, "neutral", 9).pack(anchor="w", pady=(6, 0))
+
+        _o5, statc = card(wrap)
+        sti = tk.Frame(statc, bg=t["card"]); sti._st = {"bg": "card"}
+        sti.pack(fill="x", padx=16, pady=16)
+        self._st_label(sti, "Live status", bg="card", fg="hi", font=("ui", 10, "semi"), anchor="w").pack(anchor="w", pady=(0, 8))
+        self._discord_stat_grid = tk.Frame(sti, bg=t["card"]); self._discord_stat_grid._st = {"bg": "card"}
+        self._discord_stat_grid.pack(fill="x")
+        self._discord_stat_lbls = {}
+        cells = [("Bot", "bot"), ("Messages", "in"), ("Commands", "cmds"), ("Screens", "shots"), ("Blocked", "blocked"), ("Errors", "errors")]
+        for i, (title, key) in enumerate(cells):
+            cell = tk.Frame(self._discord_stat_grid, bg=t["card"]); cell._st = {"bg": "card"}
+            cell.grid(row=0, column=i, sticky="w", padx=(0 if i == 0 else 22, 0))
+            self._st_label(cell, title, bg="card", fg="faint", font=("ui", 8), anchor="w").pack(anchor="w")
+            v = self._st_label(cell, "-", bg="card", fg="hi", font=("display", 15), anchor="w")
+            v.pack(anchor="w")
+            self._discord_stat_lbls[key] = v
+        self._st_label(sti, "Recent events", bg="card", fg="muted", font=("ui", 9), anchor="w").pack(anchor="w", pady=(12, 2))
+        self.discord_events = scrolledtext.ScrolledText(sti, font=_sf("mono", 9), bg=t["input"], fg=t["text"], bd=0,
+                                                        highlightthickness=0, height=7, wrap="word", padx=10, pady=8)
+        self.discord_events._st = {"bg": "input", "fg": "text", "font": ("mono", 9)}
+        self.discord_events.pack(fill="x")
+        self.discord_events.configure(state="disabled")
+
+        self._discord_built = True
+        self._refresh_discord_page()
+        self._fill_discord_combos(force=True)
+        if not getattr(self, "_discord_poll_on", False):
+            self._discord_poll_on = True
+            self.root.after(700, self._discord_poll)
+
+    def _on_discord_mode(self):
+        mode = self._discord_mode_var.get()
+        self.config["discord_mode"] = mode
+        self.save_settings()
+        br = getattr(self, "discord", None)
+        if br is not None:
+            br.mode = mode
+            if br.running:
+                br.event(f"mode set to {br.mode_label()}")
+        self._refresh_discord_page()
+
+    def _save_discord_owners(self):
+        try:
+            self.config["discord_owner_ids"] = self.discord_owner_entry.get().strip()
+            self.save_settings()
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
+
+    def _save_discord_toggle(self, key, var):
+        self.config[key] = bool(var.get())
+        self.save_settings()
+
+    def _discord_rescan(self):
+        br = getattr(self, "discord", None)
+        if br is None or not br.online:
+            self._set_discord_hint("Start the bot first, then press Refresh.", "warn")
+            return
+        loop, client = br.loop, br.client
+        if loop is not None and client is not None:
+            try:
+                asyncio.run_coroutine_threadsafe(_noop_rescan(br, client), loop)
+            except Exception as _ex:
+                _trace(_ex_where(), _ex)
+        self._fill_discord_combos(force=True)
+
+    def _fill_discord_combos(self, force=False):
+        br = getattr(self, "discord", None)
+        if br is None or not getattr(self, "_discord_built", False):
+            return
+        if not force and not br.guilds_dirty:
+            return
+        br.guilds_dirty = False
+        guilds = list(br.guilds)
+        gmap = {}
+        gvals = []
+        for gid, gname, chans in guilds:
+            label = f"{gname}  ({gid})"
+            gvals.append(label)
+            gmap[label] = gid
+        self._discord_gmap = gmap
+        cb = self._discord_combos["guild"]
+        cb.configure(values=gvals or ["(bot offline - start it, then Refresh)"])
+        cur_gid = self._did("discord_guild_id")
+        sel_label = next((l for l, g in gmap.items() if g == cur_gid), "")
+        if sel_label:
+            cb.set(sel_label)
+        elif cur_gid and not gvals:
+            cb.set(f"saved server {cur_gid}")
+        elif gvals and not cb.get():
+            cb.set(gvals[0])
+            self._discord_set_guild(gmap[gvals[0]])
+        self._fill_channel_combos()
+
+    def _fill_channel_combos(self):
+        br = getattr(self, "discord", None)
+        gid = self._did("discord_guild_id")
+        chans = []
+        for g, gname, cs in (br.guilds if br else []):
+            if g == gid:
+                chans = cs
+                break
+        cvals, cmap = [], {}
+        for cid, cname, ok in chans:
+            label = f"#{cname}" + ("" if ok else "  (no access)")
+            cvals.append(label)
+            cmap[label] = cid
+        self._discord_cmap = cmap
+        for key, cfgkey, allow_none in (("channel", "discord_channel_id", False), ("log", "discord_log_channel_id", True)):
+            cb = self._discord_combos[key]
+            vals = (["(none)"] if allow_none else []) + cvals
+            cb.configure(values=vals or ["(no channels)"])
+            cur = self._did(cfgkey)
+            label = next((l for l, c in cmap.items() if c == cur), "")
+            if label:
+                cb.set(label)
+            elif cur and not cvals:
+                cb.set(f"saved channel {cur}")
+            elif allow_none and not cur:
+                cb.set("(none)")
+            elif not cb.get() and vals:
+                cb.set(vals[0])
+
+    def _on_discord_pick(self, key):
+        cb = self._discord_combos[key]
+        val = cb.get()
+        if key == "guild":
+            gid = getattr(self, "_discord_gmap", {}).get(val, 0)
+            if not gid:
+                return
+            self._discord_set_guild(gid)
+            self._fill_channel_combos()
+            return
+        cfgkey = "discord_channel_id" if key == "channel" else "discord_log_channel_id"
+        if val == "(none)" and key == "log":
+            self.config[cfgkey] = ""
+        else:
+            cid = getattr(self, "_discord_cmap", {}).get(val, 0)
+            if not cid:
+                return
+            self.config[cfgkey] = str(cid)
+        self.save_settings()
+        self._refresh_discord_page()
+
+    def _discord_set_guild(self, gid):
+        new = str(gid) if gid else ""
+        if new == str(self.config.get("discord_guild_id", "") or ""):
+            return
+        self.config["discord_guild_id"] = new
+        self.config["discord_channel_id"] = ""
+        self.config["discord_log_channel_id"] = ""
+        self.save_settings()
+
+    def _did(self, key):
+        try:
+            return int(str(self.config.get(key, "") or "0").strip() or 0)
+        except Exception:
+            return 0
+
+    def _toggle_b64_ui(self):
+        self.config["b64_filter"] = bool(self._b64_var.get())
+        self.save_settings()
+        self._sync_security_marks()
+        self.toast("Base64 filter " + ("on." if self._b64_var.get() else "off."), "ok" if self._b64_var.get() else "warn")
+
+    def _palette_toggle_b64(self):
+        self.config["b64_filter"] = not self._b64_filter_on()
+        self.save_settings()
+        self._sync_security_marks()
+        self.toast("Base64 filter " + ("on." if self._b64_filter_on() else "off."), "ok" if self._b64_filter_on() else "warn")
+
+    def _clear_offenders(self):
+        n = len(self.b64_offenders)
+        self.b64_offenders = set()
+        self._save_offenders()
+        self._sync_security_marks()
+        self.toast(f"Cleared {n} blocked sender{'s' if n != 1 else ''}.", "ok")
+
+    def _sync_security_marks(self):
+        on = self._b64_filter_on()
+        if hasattr(self, "_b64_var"):
+            try: self._b64_var.set(on)
+            except Exception: pass
+        t = self._tok
+        if hasattr(self, "_b64_pill"):
+            try:
+                self._b64_pill.configure(text="ON" if on else "OFF",
+                                         bg=t["ok_tint"] if on else t["bad_tint"],
+                                         fg=t["ok_soft"] if on else t["bad_soft"],
+                                         font=_sf("ui", 8, "semi"))
+            except Exception as _ex:
+                _trace(_ex_where(), _ex)
+        if hasattr(self, "_b64_block_lbl"):
+            n = len(getattr(self, "b64_offenders", ()))
+            try:
+                self._b64_block_lbl.configure(text=(f"{n} sender{'s' if n != 1 else ''} currently blocked." if n else "No senders blocked."))
+            except Exception as _ex:
+                _trace(_ex_where(), _ex)
+
+    def _refresh_discord_page(self):
+        if not getattr(self, "_discord_built", False):
+            return
+        t = self._tok
+        br = getattr(self, "discord", None)
+        try:
+            self._discord_logo(self._discord_logo_cv, int(54 * getattr(self, "_ui_scale", 1.0)))
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
+        running = bool(br and br.running)
+        if hasattr(self, "btn_crossplay"):
+            mode = self._discord_mode_var.get() if hasattr(self, "_discord_mode_var") else "crossplay"
+            if running:
+                label = "Stop the Discord bot"
+                var = "danger"
+            else:
+                label = "Enable Discord & YouTube crossplay" if mode == "crossplay" else "Enable Discord bot"
+                var = "primary"
+            self.btn_crossplay.configure(text=label)
+            self.btn_crossplay._variant = var
+            try: self.btn_crossplay.studio_style(None, _sf("ui", 11, "semi"))
+            except Exception as _ex:
+                _trace(_ex_where(), _ex)
+        self._sync_security_marks()
+        state = (br.state if br else "stopped")
+        detail = (br.detail if br else "")
+        colors = {"online": "ok", "connecting": "warn", "installing": "warn", "error": "bad", "stopped": "muted"}
+        if hasattr(self, "_discord_state_lbl"):
+            txt = {"online": "Online", "connecting": "Connecting", "installing": "Installing discord.py",
+                   "error": "Problem", "stopped": "Stopped"}.get(state, state.title())
+            if br and br.online:
+                ch = br.channel_name(self._did("discord_channel_id"))
+                txt = f"Online as {br.user_tag}" + (f"  -  commands from {ch}" if ch else "  -  pick a command channel below")
+            elif detail:
+                txt = f"{txt} - {detail}"
+            self._discord_state_lbl.configure(text=txt, fg=_studio_color(colors.get(state, "muted"), "#A1A1AA"))
+
+    def _discord_poll(self):
+        if not getattr(self, "running", True):
+            return
+        br = getattr(self, "discord", None)
+        try:
+            if br is not None and getattr(self, "_discord_built", False):
+                if br.guilds_dirty:
+                    self._fill_discord_combos()
+                if br.dirty:
+                    br.dirty = False
+                    self._refresh_discord_page()
+                    if hasattr(self, "_discord_stat_lbls"):
+                        st = br.stats
+                        self._discord_stat_lbls["bot"].configure(
+                            text={"online": "online", "connecting": "...", "installing": "setup", "error": "error", "stopped": "off"}.get(br.state, br.state),
+                            fg=_studio_color({"online": "ok", "error": "bad"}.get(br.state, "muted"), "#A1A1AA"))
+                        for key in ("in", "cmds", "shots", "blocked", "errors"):
+                            self._discord_stat_lbls[key].configure(text=str(st.get(key, 0)))
+                    ev = list(br.events)[-40:]
+                    cur = getattr(self, "_discord_ev_n", -1)
+                    if len(ev) != cur:
+                        self._discord_ev_n = len(ev)
+                        self.discord_events.configure(state="normal")
+                        self.discord_events.delete("1.0", "end")
+                        for ts, line in ev:
+                            self.discord_events.insert("end", f"{ts}  {line}\n")
+                        self.discord_events.see("end")
+                        self.discord_events.configure(state="disabled")
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
+        try:
+            self.root.after(700, self._discord_poll)
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
+
     def build_diagnostics_tab(self):
         wrap = tk.Frame(self.tab_diag, bg="#09090B"); wrap.pack(fill="both", expand=True, padx=26, pady=18)
         top = tk.Frame(wrap, bg="#09090B"); top.pack(fill="x")
         tk.Label(top, text="DIAGNOSTICS", font=("Segoe UI", 15, "bold"), bg="#09090B", fg=self.accent_main).pack(side="left")
-        tk.Button(top, text="Run checks", font=("Segoe UI", 9, "bold"), bg="#10B981", fg="black",
-                  bd=0, cursor="hand2", command=self._refresh_diag).pack(side="right", ipady=4, ipadx=12)
-        tk.Button(top, text="Copy report", font=("Segoe UI", 9, "bold"), bg="#27272A", fg="white",
-                  bd=0, cursor="hand2", command=self._copy_diag).pack(side="right", padx=6, ipady=4, ipadx=10)
-        tk.Button(top, text="Open debug log", font=("Segoe UI", 9, "bold"), bg="#27272A", fg="white",
-                  bd=0, cursor="hand2", command=self._open_debug_log).pack(side="right", padx=6, ipady=4, ipadx=10)
-        tk.Button(top, text="Show/Hide Console", font=("Segoe UI", 9, "bold"), bg="#27272A", fg="white",
-                  bd=0, cursor="hand2", command=lambda: self._toggle_console()).pack(side="right", padx=6, ipady=4, ipadx=10)
-        tk.Button(top, text="Open Crash Log", font=("Segoe UI", 9, "bold"), bg="#EF4444", fg="white",
-                  bd=0, cursor="hand2", command=lambda: self._open_file(CRASH_LOG)).pack(side="right", padx=6, ipady=4, ipadx=10)
-        tk.Button(top, text="Open Session Log", font=("Segoe UI", 9, "bold"), bg="#27272A", fg="white",
-                  bd=0, cursor="hand2", command=lambda: self._open_file(SESSION_LOG)).pack(side="right", padx=6, ipady=4, ipadx=10)
+        brow = tk.Frame(wrap, bg="#09090B"); brow.pack(fill="x")
+        for _i, (_txt, _col, _fn) in enumerate((("Run checks", "#10B981", self._refresh_diag),
+                                ("Copy report", "#27272A", self._copy_diag),
+                                ("Open session log", "#27272A", lambda: self._open_file(SESSION_LOG)),
+                                ("Open crash log", "#EF4444", lambda: self._open_file(CRASH_LOG)),
+                                ("Open debug log", "#27272A", self._open_debug_log),
+                                ("Show / hide console", "#27272A", lambda: self._toggle_console()))):
+            tk.Button(brow, text=_txt, font=("Segoe UI", 9, "bold"), bg=_col, fg="white", bd=0, cursor="hand2",
+                      command=_fn).grid(row=_i // 3, column=_i % 3, sticky="we", padx=(0, 8), pady=(0, 6))
+        for _c in range(3):
+            brow.columnconfigure(_c, weight=1, uniform="diagbtn")
         tk.Label(wrap, text="Run the app with  --debug  for a full command-by-command trace.",
                  font=("Segoe UI", 9), bg="#09090B", fg="#8A8A96").pack(anchor="w", pady=(4, 8))
         self.diag_text = scrolledtext.ScrolledText(wrap, font=("Consolas", 10), bg="#0B0B10", fg="#D4D4D8",
@@ -6834,6 +10582,31 @@ class ChatPlaysApp:
         rest = " ".join(toks[1:]).strip()
         def flash(t, k="info", d=6): self.send_flash(t, k, d)
 
+        if cmd in ("!tob64", "!eb64"):
+            if not is_owner:
+                self.log("[system]", f"[warn] {user}: only the owner can switch the base64 filter.", "sysmsg")
+                return True
+            want_off = cmd == "!tob64"
+            self.config["b64_filter"] = not want_off
+            self.save_settings()
+            if want_off:
+                flash("base64 filter OFF", "err", 5)
+                self.log("[system]", f"[warn] base64 filter turned OFF by {user}. !eb64 turns it back on.", "sysmsg")
+            else:
+                flash("base64 filter ON", "good", 5)
+                self.log("[system]", f"base64 filter turned ON by {user}.", "sysmsg")
+            self.ui(self._sync_security_marks)
+            return True
+        if cmd in ("!unblock", "!unb64"):
+            if target and target in getattr(self, "b64_offenders", set()):
+                self.b64_offenders.discard(target)
+                self._save_offenders()
+                flash(f"{target} un-blocked", "good", 5)
+                self.log("[system]", f"{target} removed from the base64 block list by {user}.", "sysmsg")
+                self.ui(self._sync_security_marks)
+            elif target:
+                self.log("[system]", f"{target} is not on the base64 block list.", "sysmsg")
+            return True
         if cmd == "!ban":
             if target:
                 self.blacklisted_users.add(target)
@@ -6971,6 +10744,7 @@ class ChatPlaysApp:
         if cmd == "!lowpower":
             v = not self.config.get("low_power", False)
             self.config["low_power"] = v; self.save_settings()
+            self.ui(self._apply_motion_level)
             flash(f"low power {'ON' if v else 'OFF'}", "info", 5)
             return True
         if cmd == "!settle":
@@ -7043,9 +10817,7 @@ class ChatPlaysApp:
             flash("votes cleared", "info", 4); return True
         if cmd == "!title":
             if a:
-                try: self.root.title(f"{self.app_name} {version}: {vm_name} - {a}")
-                except Exception as _ex:
-                    _trace(_ex_where(), _ex)
+                self.ui(lambda _a=a: self.root.title(f"{self.app_name} {version}: {vm_name} - {_a}"))
                 self.log("[announcement]", a, "sysmsg")
             return True
 
@@ -7102,9 +10874,17 @@ class ChatPlaysApp:
         if not msg.startswith(self.command_prefix): return
         clean_user = user.replace("@", "").lower().strip()
         if clean_user in self.blacklisted_users: return
-        if clean_user in getattr(self, 'timed_bans', {}):
-            if time.time() < self.timed_bans[clean_user]: return
-            else: del self.timed_bans[clean_user]
+        if clean_user in getattr(self, "b64_offenders", set()) and not self._is_owner_name(clean_user, is_owner):
+            plog("SECURITY", f"ignored command from base64-blocked user {clean_user}")
+            return
+        _tb = self.timed_bans.get(clean_user)
+        if _tb is not None:
+            if time.time() < _tb: return
+            self.timed_bans.pop(clean_user, None)
+        _src, _ref = getattr(self._tls, "src", None) or ("youtube", None)
+        if _src != "discord":
+            if self._guard_payload(clean_user, msg, is_owner, source=_src, ref=_ref):
+                return
         for t in self.blocked_terms:
             if t in msg.lower():
                 plog("CHAIN", f"{clean_user}: message dropped by blocked term {t!r}")
@@ -7266,7 +11046,7 @@ class ChatPlaysApp:
                 continue
             if cmd == "!replay":
                 if is_owner:
-                    self.start_replay()
+                    self.ui(self.start_replay)
                 continue
             if cmd == "!revert":
                 if self.revert_disabled:
@@ -7427,7 +11207,8 @@ class ChatPlaysApp:
                                 else:
                                     is_owner = c.author.isChatOwner or clean_name in owners or clean_name == "reallyiron"
                                     is_mod = is_owner or c.author.isChatModerator or clean_name in admins
-                                if msg_lower.startswith(f"{self.command_prefix}forcefixvm"):
+                                yt_cmds_off = self._discord_exclusive()
+                                if msg_lower.startswith(f"{self.command_prefix}forcefixvm") and not yt_cmds_off:
                                     if is_mod:
                                         if platform.system() == "Windows":
                                             subprocess.run(["taskkill", "/F", "/FI", f"WINDOWTITLE eq *{vm_name}*",
@@ -7437,13 +11218,16 @@ class ChatPlaysApp:
                                         self.trigger_command(("!startvm", "", c.author.name))
                                     else: self.process_vote(c.author.name, f"{self.command_prefix}forcefixvm", 2)
                                     continue
-                                add_to_history(c.author.name, c.message, "user", is_mod, is_owner)
-                                try: self.replay_buffer.append({"t": time.time(), "u": c.author.name, "m": c.message, "mod": is_mod, "owner": is_owner})
+                                _shown = self._display_text(c.message)
+                                add_to_history(c.author.name, _shown, "user", is_mod, is_owner)
+                                if not str(c.author.name).startswith("["):
+                                    self._chat_pane_msg(c.author.name, _shown, is_mod, is_owner)
+                                try: self.replay_buffer.append({"t": time.time(), "u": c.author.name, "m": _shown, "mod": is_mod, "owner": is_owner})
                                 except Exception as _ex:
                                     _trace(_ex_where(), _ex)
-                                console_log("CHAT", f"[{c.author.name}]{' (owner)' if is_owner else (' (mod)' if is_mod else '')}: {c.message}")
-                                append_to_all_msgs_log(c.author.name, c.message)
-                                if self.listening_to_chat:
+                                console_log("CHAT", f"[{c.author.name}]{' (owner)' if is_owner else (' (mod)' if is_mod else '')}: {_shown}")
+                                append_to_all_msgs_log(c.author.name, _shown)
+                                if self.listening_to_chat and not yt_cmds_off:
                                     try: self.parse_command(c.message, c.author.name, is_mod, is_owner)
                                     except Exception as parse_ex:
                                         console_log("ERROR", f"parse_command error: {parse_ex}\n{traceback.format_exc()}")
@@ -8875,6 +12659,9 @@ class ChatPlaysApp:
         maintenance_actions = {"startvm", "revert", "restartvm", "shutdown", "changevm", "fixvm", "forcefixvm", "makesnapshot", "remake2"}
         while self.running and getattr(self, 'executor_id', 0) == thread_id:
             self.executor_tick = time.time()
+            _done = self.__dict__.pop("_exec_done", None)
+            if _done is not None:
+                self._discord_press(*_done)
             try:
                 try:
                     action = self.cmd_queue.get(timeout=0.5)
@@ -8897,6 +12684,7 @@ class ChatPlaysApp:
                     continue
                 self._exec_current = f"{cmd} {str(arg)[:40]}"
                 self._exec_started = time.time()
+                self._exec_done = (cmd, arg, user)
                 plog("EXEC", f"> {cmd} {str(arg)[:60]!r} from {user}  (left in queue={self.cmd_queue.qsize()})")
                 dbg("exec", f"START {cmd} {str(arg)[:60]!r} from {user} (queue={self.cmd_queue.qsize()})")
                 base = cmd.lower()
@@ -9387,6 +13175,7 @@ class ChatPlaysApp:
             ds.bind("<Configure>", lambda e, l=ds: l.configure(wraplength=max(80, e.width - 4)))
             for w in (outer, card, sw, nm, ds):
                 w.bind("<Button-1>", lambda e, k=key: self.apply_theme(k))
+            _mo_hover_glow(outer, ("themecard", key))
             self._theme_cards[key] = outer
         self._st_label(wrap, "Accent", bg="bg", fg="hi", font=("display", 14)).pack(anchor="w", padx=pad)
         self._st_label(wrap, "Used for primary buttons, the active page and focus rings.", bg="bg", fg="muted",
@@ -9417,6 +13206,16 @@ class ChatPlaysApp:
             b = self._st_button(srow, lbl, lambda d=d: self.set_text_size(d), "neutral", 9)
             b.pack(side="left", padx=4)
             self._size_btns[d] = b
+        self._st_label(wrap, "Motion", bg="bg", fg="hi", font=("display", 14)).pack(anchor="w", padx=pad)
+        self._st_label(wrap, "Page transitions, button feedback, sliding notices and live indicators. Low power mode turns it off.",
+                       bg="bg", fg="muted", font=("ui", 9)).pack(anchor="w", padx=pad, pady=(2, 0))
+        mrow = tk.Frame(wrap, bg=t["bg"]); mrow._st = {"bg": "bg"}
+        mrow.pack(anchor="w", padx=pad - 4, pady=(10, 24))
+        self._motion_btns = {}
+        for lbl, lv in (("Full", "full"), ("Reduced", "reduced"), ("Off", "off")):
+            b = self._st_button(mrow, lbl, lambda lv=lv: self.set_motion(lv), "neutral", 9)
+            b.pack(side="left", padx=4)
+            self._motion_btns[lv] = b
         self._st_label(wrap, "Behaviour", bg="bg", fg="hi", font=("display", 14)).pack(anchor="w", padx=pad)
         brow = tk.Frame(wrap, bg=t["bg"]); brow._st = {"bg": "bg"}
         brow.pack(anchor="w", padx=pad, pady=(10, 8))
@@ -9438,6 +13237,9 @@ class ChatPlaysApp:
         try:
             for key, outer in getattr(self, "_theme_cards", {}).items():
                 on = key == self.ui_theme
+                outer._mo_lock = on
+                MOTION.cancel(("themecard", key))
+                MOTION.col.pop(("themecard", key), None)
                 outer.configure(bg=t["accent"] if on else t["line"])
                 outer._st = {"bg": "accent" if on else "line"}
                 kids = outer.winfo_children()
@@ -9454,6 +13256,11 @@ class ChatPlaysApp:
                 b._variant = "primary" if k == d else "neutral"
                 b._st = dict(getattr(b, "_st", {}) or {}, variant=b._variant)
                 b.studio_style(None)
+            lvn = str(self.config.get("ui_motion", "full")).lower()
+            for k, b in getattr(self, "_motion_btns", {}).items():
+                b._variant = "primary" if k == lvn else "neutral"
+                b._st = dict(getattr(b, "_st", {}) or {}, variant=b._variant)
+                b.studio_style(None)
         except Exception as _ex:
             _trace(_ex_where(), _ex)
 
@@ -9463,7 +13270,7 @@ class ChatPlaysApp:
         self.config["ui_text_size"] = d
         self.save_settings()
         plog("UI", f"text size -> {d:+d}")
-        self._apply_tokens_everywhere()
+        self._dip(self._apply_tokens_everywhere)
         self.toast(f"Text size set to {({-1: 'compact', 0: 'normal', 1: 'large', 2: 'larger'})[d]}.", "ok")
 
     def apply_accent(self, col):
@@ -9473,7 +13280,7 @@ class ChatPlaysApp:
         self.save_settings()
         self._set_tokens(self.ui_theme)
         plog("UI", f"accent -> {self._tok['accent']}")
-        self._apply_tokens_everywhere()
+        self._dip(self._apply_tokens_everywhere)
 
     def _set_tokens(self, name):
         acc = self.config.get("accent_color") or ("#8B5CF6" if self.is_multistream else None)
@@ -9498,6 +13305,8 @@ class ChatPlaysApp:
             _trace(_ex_where(), _ex)
         self._studio_restyle(force=True)
         self._refresh_appearance_marks()
+        self._run_repaint_hooks()
+        _STUDIO["gen"] = _STUDIO.get("gen", 0) + 1
         try: _win_titlebar(self.root, self._tok["dark"])
         except Exception as _ex:
             _trace(_ex_where(), _ex)
@@ -9508,12 +13317,17 @@ class ChatPlaysApp:
     def apply_theme(self, name, save=True):
         if name not in _STUDIO_BASE:
             name = "original"
-        self._set_tokens(name)
-        self.config["ui_theme"] = name
+        def go(name=name):
+            self._set_tokens(name)
+            self.config["ui_theme"] = name
+            if save:
+                self.save_settings()
+            plog("UI", f"theme -> {name} ({_STUDIO_BASE[name]['name']})")
+            self._apply_tokens_everywhere()
         if save:
-            self.save_settings()
-        plog("UI", f"theme -> {name} ({_STUDIO_BASE[name]['name']})")
-        self._apply_tokens_everywhere()
+            self._dip(go)
+        else:
+            go()
 
     def build_obs_tab(self):
         wrap = tk.Frame(self.tab_obs, bg="#09090B"); wrap.pack(fill="both", expand=True, padx=40, pady=26)
@@ -9739,6 +13553,9 @@ class ChatPlaysApp:
         v = not self.config.get("low_power", False)
         self.config["low_power"] = v
         self.save_settings()
+        try: self._apply_motion_level()
+        except Exception as _ex:
+            _trace(_ex_where(), _ex)
         self.log("[system]", f"low power mode {'ON - lighter on old PCs' if v else 'OFF'}.", "sysmsg")
 
     def _toggle_console(self, show=None):
@@ -9790,6 +13607,10 @@ class ChatPlaysApp:
                   "home", "end", "pageup", "pagedown", "insert", "capslock"]
         tk.Label(wrap, text="Keys", font=("Segoe UI", 10, "bold"), bg="#09090B", fg="#A1A1AA").pack(anchor="w", padx=30)
         self._grid_buttons(wrap, [(k, "#27272A", lambda kk=k: self._send_cmd("!key", kk)) for k in common], cols=8).pack(fill="x", padx=26, pady=(4, 12))
+        tk.Label(wrap, text="Numbers", font=("Segoe UI", 10, "bold"), bg="#09090B", fg="#A1A1AA").pack(anchor="w", padx=30)
+        nums = [str(n) for n in range(1, 10)] + ["0"]
+        self._grid_buttons(wrap, [(k, "#27272A", lambda kk=k: self._send_cmd("!key", kk)) for k in nums], cols=10).pack(fill="x", padx=26, pady=(4, 12))
+        tk.Label(wrap, text="Function keys", font=("Segoe UI", 10, "bold"), bg="#09090B", fg="#A1A1AA").pack(anchor="w", padx=30)
         fkeys = [f"f{i}" for i in range(1, 13)]
         self._grid_buttons(wrap, [(k, "#27272A", lambda kk=k: self._send_cmd("!key", kk)) for k in fkeys], cols=12).pack(fill="x", padx=26, pady=(0, 12))
         tk.Label(wrap, text="Combos", font=("Segoe UI", 10, "bold"), bg="#09090B", fg="#A1A1AA").pack(anchor="w", padx=30)
@@ -10653,6 +14474,8 @@ class ChatPlaysApp:
             ("MOD", "!clearvotes / !title <text>", "clear votes / set title"),
             ("OWNER", "!replay", "replay chat with original timing"),
             ("OWNER", "!pausechat / !enablechat", "freeze / open chat"),
+            ("OWNER", "!tob64 / !eb64", "turn the base64 filter off / on"),
+            ("MOD", "!unblock <user>", "clear a base64-blocked sender"),
         ]
         self._render_help()
 
@@ -10724,7 +14547,9 @@ class ChatPlaysApp:
                           f"worst_ui_tick={getattr(self,'_ui_worst_ms',0):.0f}ms tk_timers={getattr(self,'_pending_after',-1)} "
                           f"ui_backlog={self._ui_q.qsize()} gui_console_q={gui_log_queue.qsize()} "
                           f"msg_ids={len(getattr(self,'processed_msg_ids',()))} votes={len(getattr(self,'active_votes',{}))} "
-                          f"executing={getattr(self,'_exec_current','') or '-'!r} maint={getattr(self,'vm_maintenance',False)}")
+                          f"executing={getattr(self,'_exec_current','') or '-'!r} maint={getattr(self,'vm_maintenance',False)} "
+                          f"motion=[{MOTION.stats()}]")
+                MOTION.worst_ms = 0.0
                 self._ui_worst_ms = 0.0
                 if n % 10 == 0:
                     names = sorted(t.name for t in _threading_module.enumerate())
